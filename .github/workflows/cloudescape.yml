@@ -5,7 +5,7 @@ on:
     branches: [corgi]
 
 permissions:
-  id-tone: write
+  id-token: write
   contents: read
 
 jobs:
